@@ -1,0 +1,6 @@
+/.npmrc
+/.qoder
+/dist
+/dist-electron
+/node_modules
+/Typora_Hook_Log.txt

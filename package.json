@@ -1,0 +1,44 @@
+{
+  "name": "ai-hub-desktop",
+  "version": "1.0.0",
+  "description": "AI Hub Desktop - 多大模型网页端整合桌面客户端",
+  "main": "src/main/index.js",
+  "scripts": {
+    "dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && cross-env NODE_ENV=development electron .\"",
+    "build": "vite build && electron-builder",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "vue": "^3.4.0",
+    "element-plus": "^2.7.0",
+    "@element-plus/icons-vue": "^2.3.1"
+  },
+  "devDependencies": {
+    "electron": "^30.0.0",
+    "vite": "^5.2.0",
+    "@vitejs/plugin-vue": "^5.0.0",
+    "electron-builder": "^24.13.0",
+    "concurrently": "^8.2.0",
+    "wait-on": "^7.2.0",
+    "cross-env": "^7.0.3"
+  },
+  "build": {
+    "appId": "com.aihub.desktop",
+    "productName": "AI Hub Desktop",
+    "directories": {
+      "output": "dist-electron"
+    },
+    "files": [
+      "dist/renderer/**/*",
+      "src/main/**/*"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "resources/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}
