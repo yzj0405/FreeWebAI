@@ -105,7 +105,7 @@ const visible = computed({
 
 // ---- 本地可编辑副本 ----
 const list = ref([])
-const localUrl = ref('')
+const localUrl = ref('https://raw.githubusercontent.com/yzj0405/FreeWebAI/refs/heads/main/config/model_web.json')
 const localTheme = ref('system')
 const originalJson = ref('')  // 打开弹窗时的原始快照
 
@@ -181,7 +181,8 @@ async function doSync() {
   if (!localUrl.value.trim()) return ElMessage.warning('请先输入服务器地址')
   syncing.value = true
   try {
-    const r = await ipcRenderer.invoke('config:sync')
+    // 传入当前输入的 URL，确保使用的是最新地址
+    const r = await ipcRenderer.invoke('config:sync', localUrl.value.trim())
     if (r.success) {
       ElMessage.success('同步成功')
       list.value = (r.data.models || []).map(m => ({ ...m }))
@@ -266,6 +267,27 @@ function onDrop(idx) {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  max-height: 340px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+/* 滚动条样式 */
+.model-list::-webkit-scrollbar {
+  width: 5px;
+}
+
+.model-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.model-list::-webkit-scrollbar-thumb {
+  background: rgba(128,128,128,.3);
+  border-radius: 3px;
+}
+
+.model-list::-webkit-scrollbar-thumb:hover {
+  background: rgba(128,128,128,.5);
 }
 
 .model-row {

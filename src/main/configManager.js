@@ -176,26 +176,70 @@ function writeConfig(config) {
   }
 }
 
+/**
+ * 从云端同步模型列表
+ * 目标数据格式与 model_web.json 一致: { models: [{ id, name, url, version, visible }] }
+ * @param {string} serverUrl - 服务器地址，如 https://example.com
+ */
 async function syncFromCloud(serverUrl) {
   if (!serverUrl) {
     return { success: false, error: '服务器地址未配置' }
   }
 
+  // 规范化 URL（去掉尾部斜杠）
+  const baseUrl = serverUrl.replace(/\/+$/, '')
+  // 如果已经是文件地址（如完整 GitHub raw URL），直接用；否则拼接 /model_web.json
+  const fetchUrl = baseUrl.endsWith('.json') ? baseUrl : `${baseUrl}/model_web.json`
+
   try {
     const controller = new AbortController()
     const timeoutId = setTimeout(() => controller.abort(), 10000)
 
-    const response = await fetch(`${serverUrl}/api/models`, {
-      signal: controller.signal
+    const response = await fetch(fetchUrl, {
+      signal: controller.signal,
+      headers: { 'Accept': 'application/json' }
     })
     clearTimeout(timeoutId)
 
     if (!response.ok) {
-      return { success: false, error: `服务器响应错误: ${response.status}` }
+      if (response.status === 404) {
+        return { success: false, error: `未找到配置文件 (${fetchUrl})，请确认服务器上存在 model_web.json` }
+      }
+      return { success: false, error: `服务器响应错误 (${response.status}): ${response.statusText}` }
     }
 
-    const serverData = await response.json()
-    const serverModels = serverData.models || []
+    const contentType = response.headers.get('content-type') || ''
+    if (!contentType.includes('application/json') && !contentType.includes('text/plain')) {
+      return { success: false, error: `响应类型异常: ${contentType}` }
+    }
+
+    let serverData
+    try {
+      serverData = await response.json()
+    } catch {
+      return { success: false, error: '数据格式错误，无法解析 JSON' }
+    }
+
+    // 验证数据结构
+    if (!serverData || typeof serverData !== 'object') {
+      return { success: false, error: '数据格式错误: 期望 JSON 对象' }
+    }
+    if (!Array.isArray(serverData.models)) {
+      return { success: false, error: '数据格式错误: 缺少 models 数组' }
+    }
+
+    const serverModels = serverData.models
+
+    // 验证每个模型至少包含必要字段
+    for (let i = 0; i < serverModels.length; i++) {
+      const m = serverModels[i]
+      if (!m.id || !m.name || !m.url) {
+        return { success: false, error: `数据格式错误: 第 ${i + 1} 个模型缺少 id/name/url` }
+      }
+      // 补充默认字段
+      if (m.visible === undefined) m.visible = true
+      if (!m.version) m.version = ''
+    }
 
     const localConfig = readConfig()
     const localModels = localConfig.models || []
@@ -206,48 +250,43 @@ async function syncFromCloud(serverUrl) {
       localMap.set(m.id, m)
     }
 
-    // 以服务器为底进行合并
+    // 以服务器数据为底进行合并
     const mergedModels = []
-    const serverIds = new Set()
 
     for (const serverModel of serverModels) {
-      serverIds.add(serverModel.id)
       const localModel = localMap.get(serverModel.id)
 
       if (localModel) {
         // 本地存在：保留 visible，覆盖其他字段
         mergedModels.push({
           ...serverModel,
-          visible: localModel.visible !== undefined ? localModel.visible : true
+          visible: localModel.visible !== undefined ? localModel.visible : serverModel.visible
         })
       } else {
-        // 本地不存在：作为增量新增，默认 visible: true
-        mergedModels.push({
-          ...serverModel,
-          visible: true
-        })
+        // 本地不存在：作为增量新增
+        mergedModels.push({ ...serverModel })
       }
     }
 
-    // 服务器删除的 id，本地也剔除（不在 mergedModels 中的即为剔除）
+    // 服务器已删除的模型，本地同步剔除
 
     const mergedConfig = {
       ...localConfig,
-      serverUrl: serverData.serverUrl || localConfig.serverUrl,
+      serverUrl: serverUrl,
       models: mergedModels
     }
 
     const writeResult = writeConfig(mergedConfig)
     if (!writeResult.success) {
-      return { success: false, error: writeResult.error }
+      return { success: false, error: `保存配置失败: ${writeResult.error}` }
     }
 
     return { success: true, data: mergedConfig }
   } catch (err) {
     if (err.name === 'AbortError') {
-      return { success: false, error: '同步超时' }
+      return { success: false, error: '同步超时（10 秒）' }
     }
-    return { success: false, error: err.message }
+    return { success: false, error: `网络请求失败: ${err.message}` }
   }
 }
 
