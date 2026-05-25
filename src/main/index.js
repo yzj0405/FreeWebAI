@@ -57,10 +57,8 @@ function calculateViewBounds() {
 }
 
 function createWindow() {
-  // preload 脚本路径
-  const preloadPath = isDev() 
-    ? path.join(__dirname, 'preload.js')
-    : path.join(__dirname, '../preload.js')
+  // preload 脚本路径（dev & production 都与 index.js 同目录）
+  const preloadPath = path.join(__dirname, 'preload.js')
 
   mainWindow = new BrowserWindow({
     width: 1400,

@@ -2,10 +2,11 @@
   "name": "ai-hub-desktop",
   "version": "1.0.0",
   "description": "AI Hub Desktop - 多大模型网页端整合桌面客户端",
+  "author": "AI Hub",
   "main": "src/main/index.js",
   "scripts": {
-    "dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && cross-env NODE_ENV=development electron .\"",
-    "build": "vite build && electron-builder",
+    "dev": "cross-env ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ concurrently \"vite\" \"wait-on http://localhost:5173 && cross-env NODE_ENV=development electron .\"",
+    "build": "cross-env ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ vite build && electron-builder",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -33,8 +34,19 @@
       "src/main/**/*"
     ],
     "win": {
-      "target": "nsis",
-      "icon": "resources/icon.ico"
+      "target": ["nsis"],
+      "icon": "resources/icon.ico",
+      "signAndEditExecutable": false
+    },
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "icon": "resources/icon.png",
+      "category": "Utility"
+    },
+    "mac": {
+      "target": ["dmg"],
+      "icon": "resources/icon.icns",
+      "category": "public.app-category.productivity"
     },
     "nsis": {
       "oneClick": false,
