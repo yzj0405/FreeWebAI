@@ -1,0 +1,130 @@
+{
+  "models": [
+    {
+      "id": "nvidia-build",
+      "name": "NVIDIA Build (NIM)",
+      "url": "https://build.nvidia.com/",
+      "version": "Nemotron 4 / Llama3",
+      "visible": true
+    },
+    {
+      "id": "grok",
+      "name": "Grok (xAI)",
+      "url": "https://grok.com/",
+      "version": "Grok 2 / 3",
+      "visible": true
+    },
+    {
+      "id": "deepseek",
+      "name": "DeepSeek",
+      "url": "https://chat.deepseek.com/",
+      "version": "V3 / R1",
+      "visible": true
+    },
+    {
+      "id": "chatgpt",
+      "name": "ChatGPT (OpenAI)",
+      "url": "https://chatgpt.com",
+      "version": "4o-mini / o1-mini",
+      "visible": true
+    },
+    {
+      "id": "gemini",
+      "name": "Google Gemini",
+      "url": "https://google.com",
+      "version": "2.0 Flash",
+      "visible": true
+    },
+    {
+      "id": "claude",
+      "name": "Claude AI (Anthropic)",
+      "url": "https://claude.ai",
+      "version": "3.5 Sonnet",
+      "visible": true
+    },
+    {
+      "id": "copilot",
+      "name": "Microsoft Copilot",
+      "url": "https://microsoft.com",
+      "version": "GPT-4o",
+      "visible": true
+    },
+    {
+      "id": "mistral",
+      "name": "Mistral Le Chat",
+      "url": "https://mistral.ai",
+      "version": "Large 3 / Pixtral",
+      "visible": true
+    },
+    {
+      "id": "meta-ai",
+      "name": "Meta AI",
+      "url": "https://meta.ai",
+      "version": "Llama 3.3",
+      "visible": true
+    },
+    {
+      "id": "perplexity",
+      "name": "Perplexity AI",
+      "url": "https://perplexity.ai",
+      "version": "Default Search",
+      "visible": true
+    },
+    {
+      "id": "doubao",
+      "name": "豆包 (字节跳动)",
+      "url": "https://doubao.com",
+      "version": "Doubao-pro",
+      "visible": true
+    },
+    {
+      "id": "xiaoyi",
+      "name": "小艺 (华为)",
+      "url": "https://huawei.com",
+      "version": "盘古大模型",
+      "visible": true
+    },
+    {
+      "id": "yuanbao",
+      "name": "腾讯元宝",
+      "url": "https://tencent.com",
+      "version": "混元 Hy3 / DeepSeek",
+      "visible": true
+    },
+    {
+      "id": "yiyan",
+      "name": "文心一言 (百度)",
+      "url": "https://baidu.com",
+      "version": "文心 4.5",
+      "visible": true
+    },
+    {
+      "id": "qwen",
+      "name": "通义千问 (阿里)",
+      "url": "https://qwenchat.com",
+      "version": "2.5 / Max",
+      "visible": true
+    },
+    {
+      "id": "kimi",
+      "name": "Kimi Chat (月之暗面)",
+      "url": "https://moonshot.cn",
+      "version": "K2.6",
+      "visible": true
+    },
+    {
+      "id": "xinghuo",
+      "name": "讯飞星火 (科大讯飞)",
+      "url": "https://xfyun.cn",
+      "version": "4.0 Ultra",
+      "visible": true
+    },
+    {
+      "id": "sensechat",
+      "name": "商量 (商汤科技)",
+      "url": "https://sensetime.com",
+      "version": "SenseNova 5.5",
+      "visible": true
+    }
+  ]
+}
