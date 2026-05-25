@@ -20,7 +20,7 @@ function buildErrorPage(icon, title, subtitle, retryUrl, retryText) {
   return htmlToDataUrl(`<!DOCTYPE html>
 <html><head><meta charset="UTF-8">
 <style>
-body{margin:0;display:flex;align-items:center;justify-content:center;height:100vh;background:#0f0f23;color:rgba(255,255,255,.85);font-family:sans-serif;flex-direction:column}
+body{margin:0;display:flex;align-items:center;justify-content:center;height:100vh;background:#1a1a1a;color:rgba(255,255,255,.85);font-family:sans-serif;flex-direction:column}
 .icon{font-size:48px;margin-bottom:16px}
 .msg{font-size:15px;margin-bottom:6px}
 .sub{font-size:12px;color:rgba(255,255,255,.35);max-width:80%;text-align:center;word-break:break-all;line-height:1.5;margin-bottom:24px}
@@ -114,7 +114,7 @@ function switchView(id, url) {
     })
 
     // 深色背景，避免加载时白屏闪烁
-    view.setBackgroundColor('#0f0f23')
+    view.setBackgroundColor('#1a1a1a')
 
     // 伪装 User-Agent
     view.webContents.setUserAgent(CHROME_UA)
