@@ -2,6 +2,11 @@
 
 > 多大模型网页端整合桌面客户端 — 一个窗口，访问所有 AI 对话平台。
 
+## 界面
+![alt text](./doc/homePage.png)
+
+![alt text](./doc/setting.png)
+
 ## 功能
 
 - **18 个内置模型** — 覆盖国际与国内主流 AI 平台，一键切换
@@ -20,7 +25,7 @@
 | 桌面框架 | Electron 30 |
 | 视图嵌入 | WebContentsView（原生 Chromium） |
 | 前端 | Vue 3 + Composition API |
-| UI 组件库 | Element Plus |
+| UI 组件库 | Element Plus |shuo'm
 | 构建 | Vite 5 |
 | 打包 | electron-builder（NSIS） |
 | IPC | contextBridge + ipcRenderer/ipcMain |
