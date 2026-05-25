@@ -299,6 +299,25 @@ function registerIpcHandlers() {
   ipcMain.on('theme:set', (_event, theme) => {
     nativeTheme.themeSource = theme
   })
+
+  // 检测 URL 是否可访问（用于设置中的自动检测 / 新增模型）
+  ipcMain.handle('model:check', async (_event, url) => {
+    try {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 6000)
+      const response = await fetch(url, {
+        method: 'HEAD',
+        signal: controller.signal,
+        redirect: 'follow',
+        headers: { 'User-Agent': CHROME_UA }
+      })
+      clearTimeout(timer)
+      return { accessible: response.ok || response.status < 500 }
+    } catch (err) {
+      // 网络错误（ENOTFOUND, ECONNREFUSED, ETIMEDOUT 等）→ 不可访问
+      return { accessible: false, error: err.message }
+    }
+  })
 }
 
 app.whenReady().then(createWindow)

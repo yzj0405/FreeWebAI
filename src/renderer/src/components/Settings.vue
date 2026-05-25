@@ -31,7 +31,13 @@
 
     <!-- 模型管理 -->
     <div class="block">
-      <div class="block-title">模型管理（可拖拽排序、可编辑名称和地址）</div>
+      <div class="block-title-row">
+        <span class="block-title">模型管理（可拖拽排序、可编辑名称和地址）</span>
+        <div class="block-actions">
+          <el-button size="small" :loading="checking" @click="autoCheck">自动检测</el-button>
+          <el-button size="small" @click="openAddDialog">新增</el-button>
+        </div>
+      </div>
       <div v-if="list.length === 0" class="tip">暂无模型，请先配置云端同步地址</div>
       <div class="model-list">
         <div
@@ -70,6 +76,9 @@
           />
 
           <span v-if="m.version" class="ver">v{{ m.version }}</span>
+
+          <el-button class="row-action-btn" :icon="Edit" circle size="small" @click="editModel(m)" title="修改" />
+          <el-button class="row-action-btn delete-btn" :icon="Delete" circle size="small" @click="deleteModel(m.id)" title="删除" />
         </div>
       </div>
     </div>
@@ -80,13 +89,42 @@
         <el-icon></el-icon>保存
       </el-button>
     </div>
+
+    <!-- 新增 / 修改模型子弹窗 -->
+    <el-dialog
+      v-model="showAdd"
+      :title="editingId ? '修改模型' : '新增模型'"
+      width="380px"
+      :append-to-body="false"
+      destroy-on-close
+      class="add-dialog"
+    >
+      <div class="add-field">
+        <label class="add-label">模型名称</label>
+        <el-input v-model="newModel.name" placeholder="如：ChatGPT" @input="onAddNameInput" />
+      </div>
+      <div class="add-field">
+        <label class="add-label">模型地址</label>
+        <el-input v-model="newModel.url" placeholder="如：https://chatgpt.com" />
+      </div>
+      <div class="add-field">
+        <label class="add-label">唯一标识 ID</label>
+        <el-input v-model="newModel.id" placeholder="自动生成（英文小写）" />
+      </div>
+      <template #footer>
+        <el-button @click="showAdd = false">取消</el-button>
+        <el-button type="primary" :loading="addingModel" @click="addModel">
+          {{ editingId ? '保存修改' : '检测并添加' }}
+        </el-button>
+      </template>
+    </el-dialog>
   </el-dialog>
 </template>
 
 <script setup>
 import { ref, computed, watch } from 'vue'
-import { Check, Refresh } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
+import { Check, Refresh, Delete, Edit } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 
 const { ipcRenderer } = window.electronAPI
 
@@ -234,6 +272,155 @@ function onDrop(idx) {
   dragIdx.value = -1
   dragOverIdx.value = -1
 }
+
+// ---- 自动检测 ----
+const checking = ref(false)
+
+async function autoCheck() {
+  if (list.value.length === 0) return ElMessage.warning('没有可检测的模型')
+  checking.value = true
+  let accessibleCount = 0
+  const total = list.value.length
+
+  try {
+    for (let i = 0; i < list.value.length; i++) {
+      const m = list.value[i]
+      if (!m.url) {
+        m.visible = false
+        continue
+      }
+      const r = await ipcRenderer.invoke('model:check', m.url)
+      m.visible = r.accessible
+      if (r.accessible) accessibleCount++
+    }
+
+    // 排序：可访问的排上方，不可访问的排下方（各自保持原顺序）
+    const accessible = list.value.filter(m => m.visible)
+    const inaccessible = list.value.filter(m => !m.visible)
+    list.value = [...accessible, ...inaccessible]
+
+    ElMessage.success(`检测完成: ${accessibleCount}/${total} 可访问`)
+  } catch (e) {
+    ElMessage.error('检测出错: ' + e.message)
+  } finally {
+    checking.value = false
+  }
+}
+
+// ---- 新增 / 修改模型 ----
+const showAdd = ref(false)
+const addingModel = ref(false)
+const editingId = ref(null)  // null = 新增模式，有值 = 修改模式
+const newModel = ref({ name: '', url: '', id: '' })
+
+function openAddDialog() {
+  editingId.value = null
+  newModel.value = { name: '', url: '', id: '' }
+  showAdd.value = true
+}
+
+function editModel(model) {
+  editingId.value = model.id
+  newModel.value = { name: model.name, url: model.url, id: model.id }
+  showAdd.value = true
+}
+
+// 输入名称时自动生成 id（拼音首字母）
+function onAddNameInput() {
+  const name = newModel.value.name.trim()
+  if (!name) {
+    newModel.value.id = ''
+    return
+  }
+  // 提取英文/数字直接使用，中文用拼音简化处理
+  const cleaned = name.replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, '')
+  if (/^[a-zA-Z0-9]+$/.test(cleaned)) {
+    newModel.value.id = cleaned.toLowerCase()
+  } else {
+    // 中文 → 用 name 的 hash 生成简短 id
+    let hash = 0
+    for (let i = 0; i < name.length; i++) {
+      hash = ((hash << 5) - hash) + name.charCodeAt(i)
+      hash |= 0
+    }
+    newModel.value.id = 'custom_' + Math.abs(hash).toString(36)
+  }
+}
+
+async function addModel() {
+  const m = newModel.value
+  if (!m.name.trim()) return ElMessage.warning('请输入模型名称')
+  if (!m.url.trim()) return ElMessage.warning('请输入模型地址')
+  if (!m.id.trim()) return ElMessage.warning('请输入唯一标识')
+
+  const isEdit = !!editingId.value
+
+  // 检查 id 是否重复（修改模式下，允许保持原 id）
+  if (!isEdit && list.value.some(item => item.id === m.id.trim())) {
+    return ElMessage.error('唯一标识已存在，请换一个')
+  }
+  if (isEdit && list.value.some(item => item.id === m.id.trim() && item.id !== editingId.value)) {
+    return ElMessage.error('唯一标识已存在，请换一个')
+  }
+
+  // 自动补全 http:// 前缀
+  let url = m.url.trim()
+  if (!/^https?:\/\//i.test(url)) {
+    url = 'https://' + url
+  }
+
+  addingModel.value = true
+  try {
+    const r = await ipcRenderer.invoke('model:check', url)
+    if (r.accessible) {
+      if (isEdit) {
+        // 修改模式：更新已有模型
+        const idx = list.value.findIndex(item => item.id === editingId.value)
+        if (idx >= 0) {
+          list.value[idx].name = m.name.trim()
+          list.value[idx].url = url
+          list.value[idx].id = m.id.trim()
+        }
+        editingId.value = null
+      } else {
+        // 新增模式：添加到列表，默认勾选，排在最上方
+        list.value.unshift({
+          id: m.id.trim(),
+          name: m.name.trim(),
+          url: url,
+          version: '',
+          visible: true
+        })
+      }
+      showAdd.value = false
+      ElMessage.success(isEdit ? '修改成功' : '添加成功')
+    } else {
+      ElMessage.error('无法访问该地址: ' + (r.error || '未知错误'))
+    }
+  } catch (e) {
+    ElMessage.error('检测出错: ' + e.message)
+  } finally {
+    addingModel.value = false
+  }
+}
+
+// ---- 删除模型 ----
+async function deleteModel(id) {
+  try {
+    await ElMessageBox.confirm('确定要删除该模型吗？', '确认删除', {
+      confirmButtonText: '删除',
+      cancelButtonText: '取消',
+      type: 'warning'
+    })
+    const idx = list.value.findIndex(m => m.id === id)
+    if (idx >= 0) {
+      list.value.splice(idx, 1)
+      ElMessage.success('已删除')
+    }
+  } catch {
+    // 用户取消
+  }
+}
 </script>
 
 <style scoped>
@@ -246,9 +433,22 @@ function onDrop(idx) {
   color: var(--text-muted);
   text-transform: uppercase;
   letter-spacing: .5px;
+}
+
+/* 标题行：标题 + 右侧按钮 */
+.block-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   margin-bottom: 12px;
   padding-bottom: 8px;
   border-bottom: 1px solid var(--border-subtle);
+}
+
+.block-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
 }
 
 .url-row { display: flex; gap: 10px; }
@@ -373,6 +573,45 @@ function onDrop(idx) {
   padding: 1px 6px;
   border-radius: 3px;
 }
+
+/* 行内操作按钮 */
+.row-action-btn {
+  flex-shrink: 0;
+  width: 26px !important;
+  height: 26px !important;
+  padding: 0 !important;
+  opacity: .35;
+  transition: opacity .15s, background .15s;
+}
+
+.model-row:hover .row-action-btn {
+  opacity: .7;
+}
+
+.row-action-btn:hover {
+  opacity: 1 !important;
+}
+
+.delete-btn:hover {
+  color: var(--accent) !important;
+  background: rgba(233,69,96,.15) !important;
+}
+
+/* 新增模型弹窗 */
+.add-field {
+  margin-bottom: 16px;
+}
+
+.add-field:last-of-type {
+  margin-bottom: 0;
+}
+
+.add-label {
+  display: block;
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
 </style>
 
 <style>
@@ -451,6 +690,49 @@ function onDrop(idx) {
 }
 .settings-dialog .name-input .el-input__inner::placeholder,
 .settings-dialog .url-input .el-input__inner::placeholder {
+  color: var(--text-muted);
+}
+
+/* 新增模型子弹窗 */
+.add-dialog.el-dialog {
+  background: var(--dialog-bg);
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+}
+
+.add-dialog .el-dialog__header {
+  background: var(--dialog-header-bg);
+  margin: 0;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border-color);
+  border-radius: 8px 8px 0 0;
+}
+
+.add-dialog .el-dialog__title {
+  color: var(--text-primary) !important;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.add-dialog .el-dialog__body {
+  padding: 20px;
+  color: var(--text-primary);
+}
+
+.add-dialog .el-dialog__footer {
+  padding: 0 20px 16px;
+}
+
+.add-dialog .el-input__wrapper {
+  background: var(--input-bg);
+  box-shadow: 0 0 0 1px var(--input-border) inset;
+}
+
+.add-dialog .el-input__inner {
+  color: var(--text-primary);
+}
+
+.add-dialog .el-input__inner::placeholder {
   color: var(--text-muted);
 }
 </style>
