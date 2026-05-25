@@ -26,6 +26,7 @@
   "build": {
     "appId": "com.aihub.desktop",
     "productName": "AI Hub Desktop",
+    "icon": "static/icon/icon-win.ico",
     "directories": {
       "output": "dist-electron"
     },
@@ -33,24 +34,34 @@
       "dist/renderer/**/*",
       "src/main/**/*"
     ],
+    "extraResources": [
+      {
+        "from": "static/icon",
+        "to": "icon"
+      }
+    ],
     "win": {
       "target": ["nsis"],
-      "icon": "resources/icon.ico",
-      "signAndEditExecutable": false
+      "icon": "static/icon/icon-win.ico"
     },
     "linux": {
-      "target": ["AppImage", "deb"],
-      "icon": "resources/icon.png",
-      "category": "Utility"
+      "target": ["tar.gz", "deb"],
+      "category": "Utility",
+      "maintainer": "ai-hub@example.com"
     },
     "mac": {
-      "target": ["dmg"],
-      "icon": "resources/icon.icns",
+      "target": ["tar.gz"],
       "category": "public.app-category.productivity"
     },
     "nsis": {
       "oneClick": false,
-      "allowToChangeInstallationDirectory": true
+      "allowToChangeInstallationDirectory": true,
+      "installerIcon": "static/icon/icon-win.ico",
+      "uninstallerIcon": "static/icon/icon-win.ico",
+      "installerHeaderIcon": "static/icon/icon-win.ico",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "AI Hub Desktop"
     }
   }
 }

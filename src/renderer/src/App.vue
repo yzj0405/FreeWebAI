@@ -16,8 +16,18 @@
     </div>
 
     <!-- 左侧模型列表 -->
-    <div class="sidebar">
-      <div class="sidebar-header">模型列表</div>
+    <div class="sidebar" :class="{ collapsed: sidebarCollapsed }">
+      <div class="sidebar-header">
+        <span v-show="!sidebarCollapsed">模型列表</span>
+        <el-button
+          class="toggle-btn"
+          :icon="sidebarCollapsed ? DArrowRight : DArrowLeft"
+          circle
+          size="small"
+          @click="toggleSidebar"
+          title="收起/展开侧边栏"
+        />
+      </div>
       <div class="model-list">
         <div
           v-for="model in visibleModels"
@@ -45,7 +55,7 @@
     />
 
     <!-- 模型内容区域 -->
-    <div class="content-area">
+    <div class="content-area" :class="{ expanded: sidebarCollapsed }">
       <!-- 加载中覆盖层 -->
       <div v-if="viewState === 'loading'" class="view-overlay">
         <div class="view-spinner"></div>
@@ -63,7 +73,7 @@
 
 <script setup>
 import { ref, computed, onMounted, watch } from 'vue'
-import { Setting, Minus, Close, FullScreen, CopyDocument, Refresh } from '@element-plus/icons-vue'
+import { Setting, Minus, Close, FullScreen, CopyDocument, Refresh, DArrowLeft, DArrowRight } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import Settings from './components/Settings.vue'
 
@@ -78,6 +88,12 @@ const isMaximized = ref(false)
 const theme = ref('system')
 const viewState = ref('idle')  // 'idle' | 'loading' | 'loaded' | 'error'
 const viewError = ref('')
+const sidebarCollapsed = ref(false)
+
+function toggleSidebar() {
+  sidebarCollapsed.value = !sidebarCollapsed.value
+  ipcRenderer.send('sidebar:toggle', sidebarCollapsed.value)
+}
 
 // 主题应用
 function applyTheme(t) {
@@ -291,22 +307,63 @@ onMounted(() => {
   border-right: 1px solid var(--border-subtle);
   display: flex;
   flex-direction: column;
+  transition: width 0.25s ease;
+  overflow: hidden;
+  z-index: 10;
+}
+
+.sidebar.collapsed {
+  width: 48px;
 }
 
 .sidebar-header {
-  padding: 16px;
+  padding: 8px;
   font-size: 13px;
   color: var(--text-secondary);
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.5px;
   border-bottom: 1px solid var(--border-subtle);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 52px;
+  box-sizing: border-box;
+}
+
+.sidebar-header span {
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.toggle-btn {
+  flex-shrink: 0;
+  background: transparent !important;
+  border: 1px solid var(--border-subtle) !important;
+  color: var(--text-secondary) !important;
+  width: 28px !important;
+  height: 28px !important;
+  padding: 0 !important;
+  transition: color 0.15s, background 0.15s;
+}
+
+.toggle-btn:hover {
+  color: var(--text-primary) !important;
+  background: rgba(128,128,128,.12) !important;
 }
 
 .model-list {
   flex: 1;
   overflow-y: auto;
   padding: 8px;
+  opacity: 1;
+  transition: opacity 0.15s ease;
+}
+
+.sidebar.collapsed .model-list {
+  opacity: 0;
+  pointer-events: none;
 }
 
 .model-item {
@@ -366,6 +423,11 @@ onMounted(() => {
   right: 0;
   bottom: 0;
   background: var(--bg-secondary);
+  transition: left 0.25s ease;
+}
+
+.content-area.expanded {
+  left: 48px;
 }
 
 .welcome-screen {

@@ -1,13 +1,15 @@
-const { app, BrowserWindow, WebContentsView, ipcMain, nativeTheme } = require('electron')
+const { app, BrowserWindow, WebContentsView, ipcMain, nativeTheme, nativeImage } = require('electron')
 const path = require('path')
 const { readConfig, writeConfig, syncFromCloud } = require('./configManager')
 
 let mainWindow = null
 const views = new Map()
 let currentViewId = null
+let sidebarCollapsed = false
 
 const TITLEBAR_HEIGHT = 60
 const SIDEBAR_WIDTH = 200
+const SIDEBAR_COLLAPSED_WIDTH = 48
 
 const CHROME_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 
@@ -48,10 +50,11 @@ function getRendererUrl() {
 function calculateViewBounds() {
   if (!mainWindow) return null
   const [width, height] = mainWindow.getContentSize()
+  const sidebarW = sidebarCollapsed ? SIDEBAR_COLLAPSED_WIDTH : SIDEBAR_WIDTH
   return {
-    x: SIDEBAR_WIDTH,
+    x: sidebarW,
     y: TITLEBAR_HEIGHT,
-    width: width - SIDEBAR_WIDTH,
+    width: width - sidebarW,
     height: height - TITLEBAR_HEIGHT
   }
 }
@@ -60,6 +63,11 @@ function createWindow() {
   // preload 脚本路径（dev & production 都与 index.js 同目录）
   const preloadPath = path.join(__dirname, 'preload.js')
 
+  // 窗口图标（dev 用相对路径，production 用 resources 目录）
+  const iconPath = isDev()
+    ? path.join(__dirname, '../../static/icon/icon-win.ico')
+    : path.join(process.resourcesPath, 'icon/icon-win.ico')
+
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -67,12 +75,18 @@ function createWindow() {
     minHeight: 600,
     frame: false,
     titleBarStyle: 'hidden',
+    icon: nativeImage.createFromPath(iconPath),
     webPreferences: {
       preload: preloadPath,
       nodeIntegration: false,
       contextIsolation: true
     }
   })
+
+  // 设置 AppUserModelId，确保任务栏图标正确关联
+  if (process.platform === 'win32') {
+    app.setAppUserModelId('com.aihub.desktop')
+  }
 
   mainWindow.loadURL(getRendererUrl())
 
@@ -296,6 +310,19 @@ function registerIpcHandlers() {
   // 主题切换：同步到原生层，影响所有 WebContentsView 的 prefers-color-scheme
   ipcMain.on('theme:set', (_event, theme) => {
     nativeTheme.themeSource = theme
+  })
+
+  // 侧边栏折叠/展开
+  ipcMain.on('sidebar:toggle', (_event, collapsed) => {
+    sidebarCollapsed = collapsed
+    // 重新计算当前视图的边界
+    if (currentViewId && views.has(currentViewId)) {
+      const view = views.get(currentViewId)
+      const bounds = calculateViewBounds()
+      if (bounds) {
+        view.setBounds(bounds)
+      }
+    }
   })
 
   // 检测 URL 是否可访问（用于设置中的自动检测 / 新增模型）

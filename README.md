@@ -140,3 +140,33 @@ npm run build
 - **内容区域**为 `WebContentsView` 原生 Chromium 视图，渲染在 HTML 层之上
 - 切换模型时，旧视图从 `contentView` 移除（不销毁），新视图创建/恢复
 - IPC 通道：`config:get/save`、`view:switch/reload/reloadUrl`、`theme:set`、`view:state`
+
+
+1.0版本基于electron完成基础的功能
+
+TODO：
+2.0版本
+基于Tauri重新构建，减小软件大小
+增加本地wenUI,添加自定义模型接口
+
+
+# 创建缓存目录
+$cacheDir = "$env:LOCALAPPDATA\electron-builder\Cache\winCodeSign"
+New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+
+# 从 npmmirror 下载（国内可访问）
+$url = "https://registry.npmmirror.com/-/binary/electron-builder-binaries/winCodeSign-2.6.0/winCodeSign-2.6.0.7z"
+$out = "$cacheDir\winCodeSign-2.6.0.7z"
+Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
+
+
+& "C:\Program Files\7-Zip\7z.exe" x "$cacheDir\winCodeSign-2.6.0.7z" -o"$cacheDir" -y
+
+
+%LOCALAPPDATA%\electron-builder\Cache\winCodeSign\winCodeSign-2.6.0\
+    ├── darwin\
+    ├── linux\
+    └── windows-10\
+        └── x64\
+            ├── rcedit-x64.exe   ← 关键文件
+            └── ...
