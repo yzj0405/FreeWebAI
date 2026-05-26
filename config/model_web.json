@@ -7,6 +7,20 @@
       "version": "V3 / R1",
       "visible": true
     },
+       {
+      "id": "xiaoyi",
+      "name": "小艺 (华为)",
+      "url": "https://xiaoyi.huawei.com/chat/",
+      "version": "deepseek",
+      "visible": true
+    },
+       {
+      "id": "xiaomi",
+      "name": "MiMo (小米)",
+      "url": "https://aistudio.xiaomimimo.com/#/",
+      "version": "MiMo",
+      "visible": true
+    },
     {
       "id": "doubao",
       "name": "豆包 (字节跳动)",
@@ -49,13 +63,7 @@
       "version": "4.0 Ultra",
       "visible": true
     },
-    {
-      "id": "xiaoyi",
-      "name": "小艺 (华为)",
-      "url": "https://xiaoyi.huawei.com/chat/",
-      "version": "deepseek",
-      "visible": true
-    },
+ 
     {
       "id": "sensechat",
       "name": "商量 (商汤科技)",
