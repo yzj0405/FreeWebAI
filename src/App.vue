@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
-import { Setting, Minus, FullScreen, Close, DArrowLeft, DArrowRight } from '@element-plus/icons-vue'
+import { Setting, Minus, FullScreen, Close, DArrowLeft, DArrowRight, Loading, WarningFilled, Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { tauriAPI, type Model, type AppConfig } from './utils/tauri-api'
 import { getCurrentWindow } from '@tauri-apps/api/window'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { applyTheme, type ThemeMode } from './utils/theme'
 import Settings from './components/Settings.vue'
 
@@ -15,6 +16,17 @@ const loading = ref(true)
 // 当前选中的模型
 const activeModel = ref<Model | null>(null)
 const webviewLoaded = ref(false)
+
+// 模型切换状态（loading 过渡 + 超时处理）
+type SwitchState = 'idle' | 'loading' | 'error'
+const modelSwitchState = ref<SwitchState>('idle')
+const modelSwitchError = ref('')
+let switchTimeoutTimer: ReturnType<typeof setTimeout> | null = null
+const SWITCH_TIMEOUT = 15000 // 15秒超时
+
+// WebView 页面加载事件监听器
+let unlistenPageLoaded: UnlistenFn | null = null
+
 let sidebarTimer: ReturnType<typeof setTimeout> | null = null
 let resizeTimer: ReturnType<typeof setTimeout> | null = null
 let unlistenResize: (() => void) | null = null
@@ -44,25 +56,57 @@ function handleModelClick(model: Model) {
 
 // 通过 Rust 命令加载网页到右侧 WebView（URL 变化时重建）
 async function loadModelInWebview(url: string) {
+  // 清除之前的超时定时器
+  if (switchTimeoutTimer) clearTimeout(switchTimeoutTimer)
+  
+  modelSwitchState.value = 'loading'
+  modelSwitchError.value = ''
+  webviewLoaded.value = false
+  
+  // 超时兜底
+  switchTimeoutTimer = setTimeout(() => {
+    if (modelSwitchState.value === 'loading') {
+      modelSwitchState.value = 'error'
+      modelSwitchError.value = '连接超时，请检查网络后重试'
+    }
+  }, SWITCH_TIMEOUT)
+  
   try {
-    webviewLoaded.value = false
-    
     // 等待 DOM 更新后获取容器位置
     await new Promise(resolve => setTimeout(resolve, 50))
     
     const container = document.getElementById('webview-container')
     if (!container) {
-      ElMessage.error('容器未找到')
+      if (switchTimeoutTimer) clearTimeout(switchTimeoutTimer)
+      modelSwitchState.value = 'error'
+      modelSwitchError.value = '容器未找到'
       return
     }
     
     const rect = container.getBoundingClientRect()
     
     await tauriAPI.loadContentWebview(url, rect.left, rect.top, rect.width, rect.height)
+    
+    // WebView 已创建，但页面内容可能还在加载中
+    // 保持 loading 状态，等待 Rust 侧 on_page_load → webview:page-loaded 事件
     webviewLoaded.value = true
   } catch (error) {
+    if (switchTimeoutTimer) clearTimeout(switchTimeoutTimer)
     console.error('加载 WebView 失败:', error)
-    ElMessage.error('网页加载失败: ' + (error as Error).message)
+    modelSwitchState.value = 'error'
+    modelSwitchError.value = '网页加载失败: ' + (error as Error).message
+  }
+}
+
+function retryLoadModel() {
+  if (activeModel.value) {
+    loadModelInWebview(activeModel.value.url)
+  }
+}
+
+function refreshCurrentModel() {
+  if (activeModel.value) {
+    loadModelInWebview(activeModel.value.url)
   }
 }
 
@@ -148,6 +192,12 @@ async function closeSettings() {
 onMounted(async () => {
   await loadConfig()
   
+  // 监听 WebView 页面真实加载完成事件（Rust on_page_load 回调）
+  unlistenPageLoaded = await listen('webview:page-loaded', () => {
+    if (switchTimeoutTimer) clearTimeout(switchTimeoutTimer)
+    modelSwitchState.value = 'idle'
+  })
+  
   // 监听窗口大小变化，自动调整 WebView
   unlistenResize = await getCurrentWindow().onResized(() => {
     scheduleWebviewResize()
@@ -180,7 +230,9 @@ async function handleSyncCloud(serverUrl: string) {
 onBeforeUnmount(() => {
   if (sidebarTimer) clearTimeout(sidebarTimer)
   if (resizeTimer) clearTimeout(resizeTimer)
+  if (switchTimeoutTimer) clearTimeout(switchTimeoutTimer)
   if (unlistenResize) unlistenResize()
+  if (unlistenPageLoaded) unlistenPageLoaded()
 })
 </script>
 
@@ -192,7 +244,10 @@ onBeforeUnmount(() => {
         <span class="app-title">AI Hub Desktop</span>
       </div>
       <div class="titlebar-right">
-        <el-button @click="openSettings" circle size="small">
+        <el-button @click="refreshCurrentModel" circle size="small" :disabled="!activeModel" title="刷新当前页面">
+          <el-icon><Refresh /></el-icon>
+        </el-button>
+        <el-button @click="openSettings" circle size="small" title="设置">
           <el-icon><Setting /></el-icon>
         </el-button>
         <el-button @click="tauriAPI.minimizeWindow()" circle size="small">
@@ -248,6 +303,23 @@ onBeforeUnmount(() => {
       <main class="content-area">
         <!-- WebView 容器 -->
         <div id="webview-container"></div>
+        
+        <!-- 模型切换加载过渡层 -->
+        <div v-if="modelSwitchState === 'loading'" class="switch-overlay">
+          <div class="switch-loading">
+            <el-icon class="is-loading" :size="48"><Loading /></el-icon>
+            <p class="switch-text">正在加载 {{ activeModel?.name }}...</p>
+          </div>
+        </div>
+        
+        <!-- 加载失败/超时层 -->
+        <div v-else-if="modelSwitchState === 'error'" class="switch-overlay">
+          <div class="switch-error">
+            <el-icon :size="48"><WarningFilled /></el-icon>
+            <p class="switch-text">{{ modelSwitchError }}</p>
+            <el-button type="primary" @click="retryLoadModel">重试</el-button>
+          </div>
+        </div>
         
         <!-- 欢迎页面（未选择模型时显示） -->
         <div v-if="!activeModel" class="welcome-screen">
@@ -485,5 +557,38 @@ onBeforeUnmount(() => {
   display: flex;
   justify-content: center;
   gap: 12px;
+}
+
+/* 模型切换过渡层 */
+.switch-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: var(--bg-color);
+  z-index: 5;
+}
+
+.switch-loading,
+.switch-error {
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+}
+
+.switch-text {
+  font-size: 15px;
+  color: var(--text-color);
+  margin: 0;
+}
+
+.switch-error .el-icon {
+  color: #f56c6c;
 }
 </style>

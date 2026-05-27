@@ -174,11 +174,19 @@ pub async fn load_content_webview(
     // 解析 URL
     let webview_url = url::Url::parse(&url).map_err(|e| format!("URL 解析失败: {}", e))?;
     
-    // 创建新的 WebView builder
+    // 克隆 window 句柄给 on_page_load 回调
+    let window_handle = window.clone();
+    
+    // 创建新的 WebView builder，监听页面加载状态
     let webview_builder = tauri::webview::WebviewBuilder::new(
         "content-webview",
         tauri::WebviewUrl::External(webview_url),
-    );
+    ).on_page_load(move |_webview, payload| {
+        use tauri::webview::PageLoadEvent;
+        if payload.event() == PageLoadEvent::Finished {
+            let _ = window_handle.emit("webview:page-loaded", "");
+        }
+    });
     
     // 作为子视图添加到主窗口
     window.add_child(
