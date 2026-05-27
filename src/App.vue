@@ -269,6 +269,7 @@ onBeforeUnmount(() => {
     <Settings 
       v-model="settingsVisible"
       :config="config"
+      :sidebar-collapsed="config?.sidebarCollapsed ?? false"
       @save="handleSaveConfig"
       @sync="handleSyncCloud"
       @close="closeSettings"

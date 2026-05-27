@@ -8,6 +8,7 @@ import { applyTheme, type ThemeMode } from '../utils/theme'
 const props = defineProps<{
   modelValue: boolean
   config: AppConfig | null
+  sidebarCollapsed: boolean
 }>()
 
 const emit = defineEmits<{
@@ -225,6 +226,7 @@ async function checkAllModels() {
     title="设置"
     width="900px"
     :close-on-click-modal="false"
+    :style="{ transform: sidebarCollapsed ? 'translateX(30px)' : 'translateX(120px)' }"
   >
     <div v-if="localConfig" class="settings-container">
       <!-- 主题设置 -->
@@ -241,7 +243,7 @@ async function checkAllModels() {
         <div style="display: flex; gap: 10px; width: 100%">
           <el-input 
             v-model="localConfig.serverUrl" 
-            placeholder="https://yourdomain.com"
+            placeholder="https://raw.githubusercontent.com/yzj0405/FreeWebAI/refs/heads/v2.0/config/model_web.json"
             clearable
             style="flex: 1"
           />

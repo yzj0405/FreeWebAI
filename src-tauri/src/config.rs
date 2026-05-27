@@ -31,7 +31,7 @@ fn default_theme() -> String {
 }
 
 fn default_server_url() -> String {
-    String::new()
+    "https://raw.githubusercontent.com/yzj0405/FreeWebAI/refs/heads/v2.0/config/model_web.json".to_string()
 }
 
 /// 获取配置文件路径
