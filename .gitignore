@@ -1,3 +1,4 @@
 .qoder
 .vscode
 node_modules
+dist
