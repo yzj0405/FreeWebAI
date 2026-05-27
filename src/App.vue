@@ -116,9 +116,12 @@ async function toggleSidebar() {
     }, 300)
   }
   
-  // 侧边栏宽度变化后，重新调整 WebView 位置
+  // 侧边栏动画完成后，重新调整 WebView 位置
   if (activeModel.value) {
-    await new Promise(resolve => setTimeout(resolve, 350))
+    // 收起：0ms 延迟 + 300ms 动画 + 50ms 余量 = 350ms
+    // 展开：300ms 延迟 + 300ms 动画 + 50ms 余量 = 650ms
+    const delay = newCollapsed ? 350 : 650
+    await new Promise(resolve => setTimeout(resolve, delay))
     resizeWebviewOnly()
   }
 }
@@ -207,7 +210,7 @@ onBeforeUnmount(() => {
     <!-- 主内容区 -->
     <div class="main-content">
       <!-- 左侧边栏 -->
-      <aside class="sidebar" :class="{ collapsed: config?.sidebarCollapsed }">
+      <aside class="sidebar" :class="{ collapsed: sidebarVisualCollapsed }">
         <div class="model-list">
           <div 
             v-for="model in visibleModels" 
@@ -327,10 +330,34 @@ onBeforeUnmount(() => {
   flex-direction: column;
   transition: width 0.3s ease;
   position: relative;
+  overflow-x: hidden;
 }
 
 .sidebar.collapsed {
   width: 60px;
+}
+
+.sidebar.collapsed .model-list {
+  padding: 6px 4px;
+}
+
+.sidebar.collapsed .model-item {
+  padding: 6px 4px;
+  margin-bottom: 2px;
+  display: flex;
+  justify-content: center;
+}
+
+.sidebar.collapsed .model-item.active {
+  border-left: none;
+  border-radius: 6px;
+  background-color: var(--active-bg, rgba(64, 158, 255, 0.2));
+}
+
+.sidebar.collapsed .model-abbr {
+  width: 32px;
+  height: 32px;
+  font-size: 14px;
 }
 
 .model-list {
