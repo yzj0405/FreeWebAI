@@ -85,7 +85,7 @@ async function loadModelInWebview(url: string) {
     
     const rect = container.getBoundingClientRect()
     
-    await tauriAPI.loadContentWebview(url, rect.left, rect.top, rect.width, rect.height)
+    await tauriAPI.loadContentWebview(url, rect.left, rect.top, rect.width, rect.height, config.value?.theme || 'system')
     
     // WebView 已创建，但页面内容可能还在加载中
     // 保持 loading 状态，等待 Rust 侧 on_page_load → webview:page-loaded 事件
@@ -196,6 +196,7 @@ onMounted(async () => {
   unlistenPageLoaded = await listen('webview:page-loaded', () => {
     if (switchTimeoutTimer) clearTimeout(switchTimeoutTimer)
     modelSwitchState.value = 'idle'
+    // 主题由 initialization_script 在页面加载时自动应用，无需额外同步
   })
   
   // 监听窗口大小变化，自动调整 WebView
@@ -205,10 +206,12 @@ onMounted(async () => {
 })
 
 async function handleSaveConfig(newConfig: AppConfig) {
+  // 先同步更新 config，确保 closeSettings 重建 WebView 时使用新主题
+  config.value = newConfig
+  applyTheme(newConfig.theme as ThemeMode)
+  
   try {
     await tauriAPI.saveConfig(newConfig)
-    config.value = newConfig
-    applyTheme(newConfig.theme as ThemeMode)
     ElMessage.success('配置已保存')
   } catch (error) {
     ElMessage.error('保存配置失败')

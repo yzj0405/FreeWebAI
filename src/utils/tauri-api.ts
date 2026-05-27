@@ -30,11 +30,12 @@ export const tauriAPI = {
   toggleSidebar: (collapsed: boolean) => invoke('toggle_sidebar', { collapsed }),
   
   // 内容 WebView 管理（在主窗口内嵌显示网页）
-  loadContentWebview: (url: string, x: number, y: number, width: number, height: number) => 
-    invoke('load_content_webview', { url, x, y, width, height }),
+  loadContentWebview: (url: string, x: number, y: number, width: number, height: number, theme: string) => 
+    invoke('load_content_webview', { url, x, y, width, height, theme }),
   resizeContentWebview: (x: number, y: number, width: number, height: number) => 
     invoke('resize_content_webview', { x, y, width, height }),
   hideContentWebview: () => invoke('hide_content_webview'),
+  setWebviewTheme: (theme: string) => invoke('set_webview_theme', { theme }),
   
   // 主窗口控制
   minimizeWindow: () => {

@@ -20,6 +20,7 @@ pub fn run() {
             commands::hide_content_webview,
             commands::resize_content_webview,
             commands::load_content_webview,
+            commands::set_webview_theme,
         ])
         .setup(|app| {
             // 初始化配置
