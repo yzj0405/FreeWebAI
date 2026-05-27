@@ -32,6 +32,9 @@ export const tauriAPI = {
   // 内容 WebView 管理（在主窗口内嵌显示网页）
   loadContentWebview: (url: string, x: number, y: number, width: number, height: number) => 
     invoke('load_content_webview', { url, x, y, width, height }),
+  resizeContentWebview: (x: number, y: number, width: number, height: number) => 
+    invoke('resize_content_webview', { x, y, width, height }),
+  hideContentWebview: () => invoke('hide_content_webview'),
   
   // 主窗口控制
   minimizeWindow: () => {

@@ -17,6 +17,8 @@ pub fn run() {
             commands::toggle_maximize,
             commands::close_window,
             commands::toggle_sidebar,
+            commands::hide_content_webview,
+            commands::resize_content_webview,
             commands::load_content_webview,
         ])
         .setup(|app| {

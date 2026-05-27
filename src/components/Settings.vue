@@ -195,9 +195,11 @@ async function checkAllModels() {
           accessibleModels.push(model)
           model.visible = true // 自动勾选可访问的模型
         } else {
+          model.visible = false // 自动取消勾选不可访问的模型
           inaccessibleModels.push(model)
         }
       } catch {
+        model.visible = false // 检测异常也取消勾选
         inaccessibleModels.push(model)
       }
     })

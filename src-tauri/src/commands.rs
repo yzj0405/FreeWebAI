@@ -113,6 +113,43 @@ pub async fn toggle_sidebar(app: AppHandle, collapsed: bool) -> Result<(), Strin
     Ok(())
 }
 
+/// 隐藏/移除主窗口内的内容 WebView
+#[tauri::command]
+pub async fn hide_content_webview(app: AppHandle) -> Result<(), String> {
+    let window = app.get_window("main").ok_or("主窗口未找到")?;
+    let webviews = window.webviews();
+    for w in &webviews {
+        if w.label() == "content-webview" {
+            let _ = w.close();
+        }
+    }
+    Ok(())
+}
+
+/// 调整内容 WebView 的位置和大小（不重建，避免白屏闪烁）
+#[tauri::command]
+pub async fn resize_content_webview(
+    app: AppHandle,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    let window = app.get_window("main").ok_or("主窗口未找到")?;
+    let webviews = window.webviews();
+    for w in &webviews {
+        if w.label() == "content-webview" {
+            w.set_position(tauri::LogicalPosition::new(x, y))
+                .map_err(|e| format!("调整位置失败: {}", e))?;
+            w.set_size(tauri::LogicalSize::new(width, height))
+                .map_err(|e| format!("调整大小失败: {}", e))?;
+            return Ok(());
+        }
+    }
+    // 如果 WebView 不存在，静默忽略
+    Ok(())
+}
+
 /// 在主窗口内加载内容 WebView（右侧显示外部网页）
 #[tauri::command]
 pub async fn load_content_webview(

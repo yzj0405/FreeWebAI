@@ -3,6 +3,7 @@ import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import { Setting, Minus, FullScreen, Close, DArrowLeft, DArrowRight } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { tauriAPI, type Model, type AppConfig } from './utils/tauri-api'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import { applyTheme, type ThemeMode } from './utils/theme'
 import Settings from './components/Settings.vue'
 
@@ -14,6 +15,9 @@ const loading = ref(true)
 // 当前选中的模型
 const activeModel = ref<Model | null>(null)
 const webviewLoaded = ref(false)
+let sidebarTimer: ReturnType<typeof setTimeout> | null = null
+let resizeTimer: ReturnType<typeof setTimeout> | null = null
+let unlistenResize: (() => void) | null = null
 
 const visibleModels = computed(() => 
   config.value?.models.filter(m => m.visible) || []
@@ -22,6 +26,7 @@ const visibleModels = computed(() =>
 async function loadConfig() {
   try {
     config.value = await tauriAPI.getConfig()
+    sidebarVisualCollapsed.value = config.value.sidebarCollapsed
     applyTheme(config.value.theme as ThemeMode)
   } catch (error) {
     ElMessage.error('加载配置失败')
@@ -37,7 +42,7 @@ function handleModelClick(model: Model) {
   loadModelInWebview(model.url)
 }
 
-// 通过 Rust 命令加载网页到右侧 WebView
+// 通过 Rust 命令加载网页到右侧 WebView（URL 变化时重建）
 async function loadModelInWebview(url: string) {
   try {
     webviewLoaded.value = false
@@ -61,32 +66,89 @@ async function loadModelInWebview(url: string) {
   }
 }
 
+// 仅调整 WebView 位置/大小（不重建，无白屏闪烁）
+async function resizeWebviewOnly() {
+  try {
+    const container = document.getElementById('webview-container')
+    if (!container) return
+    const rect = container.getBoundingClientRect()
+    await tauriAPI.resizeContentWebview(rect.left, rect.top, rect.width, rect.height)
+  } catch (error) {
+    console.error('调整 WebView 大小失败:', error)
+  }
+}
+
+// 窗口大小变化时，防抖调整 WebView（只 resize，不重建）
+function scheduleWebviewResize() {
+  if (!activeModel.value) return
+  if (resizeTimer) clearTimeout(resizeTimer)
+  resizeTimer = setTimeout(() => {
+    resizeWebviewOnly()
+  }, 150)
+}
+
 async function toggleMaximize() {
   await tauriAPI.toggleMaximize()
-  const win = await import('@tauri-apps/api/window')
-  const currentWin = win.getCurrentWindow()
-  isMaximized.value = await currentWin.isMaximized()
+  isMaximized.value = await getCurrentWindow().isMaximized()
+  // 最大化/还原后 WebView 需要重新适配
+  scheduleWebviewResize()
 }
+
+// 侧边栏视觉折叠状态（延迟切换，与 CSS 动画同步）
+const sidebarVisualCollapsed = ref(config.value?.sidebarCollapsed ?? false)
 
 async function toggleSidebar() {
   if (!config.value) return
   const newCollapsed = !config.value.sidebarCollapsed
   config.value.sidebarCollapsed = newCollapsed
   await tauriAPI.toggleSidebar(newCollapsed)
+  
+  // 清除之前的定时器
+  if (sidebarTimer) clearTimeout(sidebarTimer)
+  
+  if (newCollapsed) {
+    // 收起：内容立即切换为缩写
+    sidebarVisualCollapsed.value = true
+  } else {
+    // 展开：延迟切换内容，等宽度动画完成后再显示全名
+    sidebarTimer = setTimeout(() => {
+      sidebarVisualCollapsed.value = false
+    }, 300)
+  }
+  
+  // 侧边栏宽度变化后，重新调整 WebView 位置
+  if (activeModel.value) {
+    await new Promise(resolve => setTimeout(resolve, 350))
+    resizeWebviewOnly()
+  }
 }
 
 // 打开设置弹窗
-function openSettings() {
+async function openSettings() {
+  // 隐藏原生 WebView，否则会遮挡 dialog
+  if (activeModel.value) {
+    await tauriAPI.hideContentWebview()
+    webviewLoaded.value = false
+  }
   settingsVisible.value = true
 }
 
 // 关闭设置弹窗
-function closeSettings() {
+async function closeSettings() {
   settingsVisible.value = false
+  // 恢复 WebView
+  if (activeModel.value) {
+    loadModelInWebview(activeModel.value.url)
+  }
 }
 
-onMounted(() => {
-  loadConfig()
+onMounted(async () => {
+  await loadConfig()
+  
+  // 监听窗口大小变化，自动调整 WebView
+  unlistenResize = await getCurrentWindow().onResized(() => {
+    scheduleWebviewResize()
+  })
 })
 
 async function handleSaveConfig(newConfig: AppConfig) {
@@ -112,11 +174,11 @@ async function handleSyncCloud(serverUrl: string) {
   }
 }
 
-onMounted(() => {
-  loadConfig()
+onBeforeUnmount(() => {
+  if (sidebarTimer) clearTimeout(sidebarTimer)
+  if (resizeTimer) clearTimeout(resizeTimer)
+  if (unlistenResize) unlistenResize()
 })
-
-onBeforeUnmount(() => {})
 </script>
 
 <template>
@@ -151,9 +213,12 @@ onBeforeUnmount(() => {})
             v-for="model in visibleModels" 
             :key="model.id"
             class="model-item"
+            :class="{ active: activeModel?.id === model.id }"
+            :title="model.name"
             @click="handleModelClick(model)"
           >
-            <div class="model-info">
+            <span v-if="sidebarVisualCollapsed" class="model-abbr">{{ model.name.charAt(0) }}</span>
+            <div v-else class="model-info">
               <span class="model-name">{{ model.name }}</span>
               <span class="model-version">{{ model.version }}</span>
             </div>
@@ -286,6 +351,11 @@ onBeforeUnmount(() => {})
   background-color: var(--hover-bg);
 }
 
+.model-item.active {
+  background-color: var(--active-bg, rgba(64, 158, 255, 0.15));
+  border-left: 3px solid var(--active-border, #409EFF);
+}
+
 .model-info {
   display: flex;
   flex-direction: column;
@@ -303,9 +373,18 @@ onBeforeUnmount(() => {})
   color: #999;
 }
 
-.sidebar.collapsed .model-name,
-.sidebar.collapsed .model-version {
-  display: none;
+.model-abbr {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-color);
+  border-radius: 6px;
+  background-color: var(--hover-bg);
+  text-transform: uppercase;
 }
 
 .empty-models {
