@@ -20,6 +20,9 @@ importers:
       element-plus:
         specifier: ^2.14.0
         version: 2.14.0(vue@3.5.34(typescript@5.6.2))
+      sortablejs:
+        specifier: ^1.15.7
+        version: 1.15.7
       vue:
         specifier: ^3.5.13
         version: 3.5.34(typescript@5.6.2)
@@ -27,6 +30,9 @@ importers:
       '@tauri-apps/cli':
         specifier: ^2.11.2
         version: 2.11.2
+      '@types/sortablejs':
+        specifier: ^1.15.9
+        version: 1.15.9
       '@vitejs/plugin-vue':
         specifier: ^5.2.1
         version: 5.2.1(vite@6.4.2)(vue@3.5.34(typescript@5.6.2))
@@ -462,6 +468,9 @@ packages:
   '@types/lodash@4.17.24':
     resolution: {integrity: sha512-gIW7lQLZbue7lRSWEFql49QJJWThrTFFeIMJdp3eH4tKoxm1OvEPg02rm4wCCSHS0cL3/Fizimb35b7k8atwsQ==}
 
+  '@types/sortablejs@1.15.9':
+    resolution: {integrity: sha512-7HP+rZGE2p886PKV9c9OJzLBI6BBJu1O7lJGYnPyG3fS4/duUCcngkNCjsLwIMV+WMqANe3tt4irrXHSIe68OQ==}
+
   '@types/web-bluetooth@0.0.21':
     resolution: {integrity: sha512-oIQLCGWtcFZy2JW77j9k8nHzAOpqMHLQejDA48XXMWH6tjCQHz5RCFz1bzsmROyL6PUm+LLnUiI4BCn221inxA==}
 
@@ -647,6 +656,9 @@ packages:
     resolution: {integrity: sha512-rkVq3IXh+4FDGch+KwzX3aV9W3kO54GyEgpvBzSyctDA6Xtd7RJQV1xmXbeQp5v7+VzLOfVqiutSE6GICgPFvg==}
     engines: {node: '>=10'}
     hasBin: true
+
+  sortablejs@1.15.7:
+    resolution: {integrity: sha512-Kk8wLQPlS+yi1ZEf48a4+fzHa4yxjC30M/Sr2AnQu+f/MPwvvX9XjZ6OWejiz8crBsLwSq8GHqaxaET7u6ux0A==}
 
   source-map-js@1.2.1:
     resolution: {integrity: sha512-UXWMKhLOwVKb728IUtQPXxfYU+usdybtUrK/8uGE8CQMvrhOpwvzDBwj0QhSL7MQc7vIsISBG8VQ8+IDQxpfQA==}
@@ -968,6 +980,8 @@ snapshots:
 
   '@types/lodash@4.17.24': {}
 
+  '@types/sortablejs@1.15.9': {}
+
   '@types/web-bluetooth@0.0.21': {}
 
   '@vitejs/plugin-vue@5.2.1(vite@6.4.2)(vue@3.5.34(typescript@5.6.2))':
@@ -1218,6 +1232,8 @@ snapshots:
       fsevents: 2.3.3
 
   semver@7.8.1: {}
+
+  sortablejs@1.15.7: {}
 
   source-map-js@1.2.1: {}
 

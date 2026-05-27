@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue'
+import { ref, computed, watch, nextTick } from 'vue'
 import { Plus, Refresh, Check } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import Sortable from 'sortablejs'
 import { tauriAPI, type AppConfig, type Model } from '../utils/tauri-api'
 import { applyTheme, type ThemeMode } from '../utils/theme'
 
@@ -24,6 +25,8 @@ const isCheckingAll = ref(false)
 const editDialogVisible = ref(false)
 const editingModel = ref<Model | null>(null)
 const isEditDialog = ref(false)
+const tableRef = ref()
+const sortableInstance = ref<Sortable | null>(null)
 
 // 深拷贝配置
 watch(() => props.config, (newConfig) => {
@@ -138,28 +141,40 @@ async function deleteModel(model: Model) {
   }
 }
 
-// 拖拽排序
-const dragIndex = ref<number | null>(null)
+// 拖拽排序 - 使用 SortableJS
+function initSortable() {
+  const tbody = tableRef.value?.$el?.querySelector('.el-table__body-wrapper tbody')
+  if (!tbody) {
+    console.warn('[Sortable] tbody not found')
+    return
+  }
 
-function handleDragStart(event: DragEvent, index: number) {
-  dragIndex.value = index
-  event.dataTransfer!.effectAllowed = 'move'
+  // 销毁旧实例
+  if (sortableInstance.value) {
+    sortableInstance.value.destroy()
+    sortableInstance.value = null
+  }
+
+  sortableInstance.value = Sortable.create(tbody, {
+    animation: 150,
+    handle: '.drag-handle',
+    forceFallback: true,
+    ghostClass: 'sortable-ghost',
+    chosenClass: 'sortable-chosen',
+    dragClass: 'sortable-drag',
+    onEnd: ({ newIndex, oldIndex }) => {
+      if (oldIndex === undefined || newIndex === undefined || !localConfig.value) return
+      const currRow = localConfig.value.models.splice(oldIndex, 1)[0]
+      localConfig.value.models.splice(newIndex, 0, currRow)
+    }
+  })
 }
 
-function handleDragOver(event: DragEvent) {
-  event.preventDefault()
-  event.dataTransfer!.dropEffect = 'move'
-}
-
-function handleDrop(event: DragEvent, targetIndex: number) {
-  event.preventDefault()
-  if (dragIndex.value === null || dragIndex.value === targetIndex) return
-  
-  if (!localConfig.value) return
-  const models = localConfig.value.models
-  const [moved] = models.splice(dragIndex.value, 1)
-  models.splice(targetIndex, 0, moved)
-  dragIndex.value = null
+// 弹窗打开动画结束后初始化拖拽
+function onDialogOpened() {
+  nextTick(() => {
+    initSortable()
+  })
 }
 
 // 检测模型可用性
@@ -223,6 +238,7 @@ async function checkAllModels() {
   <el-dialog 
     :model-value="modelValue"
     @update:model-value="handleClose"
+    @opened="onDialogOpened"
     title="设置"
     width="900px"
     :close-on-click-modal="false"
@@ -279,20 +295,16 @@ async function checkAllModels() {
         </div>
 
         <el-table 
+          ref="tableRef"
           :data="localConfig.models" 
           border
           style="width: 100%"
           max-height="400"
+          :row-key="(row: Model) => row.id"
         >
           <el-table-column label="拖拽" width="60" align="center">
-            <template #default="{ $index }">
-              <div
-                draggable="true"
-                @dragstart="handleDragStart($event, $index)"
-                @dragover="handleDragOver"
-                @drop="handleDrop($event, $index)"
-                class="drag-handle"
-              >
+            <template #default>
+              <div class="drag-handle">
                 ⋮⋮
               </div>
             </template>
@@ -326,9 +338,6 @@ async function checkAllModels() {
 
     <template #footer>
       <div class="dialog-footer">
-        <span v-if="hasChanges" class="unsaved-hint">
-          未保存的更改将在关闭时自动保存
-        </span>
         <el-button @click="handleClose">关闭</el-button>
       </div>
     </template>
@@ -408,7 +417,7 @@ async function checkAllModels() {
 
 .dialog-footer {
   display: flex;
-  justify-content: space-between;
+  justify-content: flex-end;
   align-items: center;
 }
 
@@ -427,5 +436,21 @@ async function checkAllModels() {
 .action-buttons .el-button {
   margin: 0;
   white-space: nowrap;
+}
+
+/* SortableJS 拖拽样式 */
+.sortable-ghost {
+  opacity: 0.4;
+  background: var(--el-fill-color-light);
+}
+
+.sortable-chosen {
+  background: var(--el-color-primary-light-9);
+}
+
+.sortable-drag {
+  opacity: 0.8;
+  background: var(--el-bg-color);
+  box-shadow: 0 2px 12px 0 rgba(0, 0, 0, 0.1);
 }
 </style>
