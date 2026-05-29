@@ -21,6 +21,13 @@ pub fn run() {
             commands::resize_content_webview,
             commands::load_content_webview,
             commands::set_webview_theme,
+            // 新增：多 WebView 缓存支持
+            commands::get_or_create_model_webview,
+            commands::switch_to_model,
+            commands::resize_model_webview,
+            commands::hide_model_webview,
+            commands::hide_all_model_webviews,
+            commands::clear_all_model_webviews,
         ])
         .setup(|app| {
             // 初始化配置

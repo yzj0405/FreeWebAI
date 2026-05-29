@@ -31,6 +31,9 @@ let sidebarTimer: ReturnType<typeof setTimeout> | null = null
 let resizeTimer: ReturnType<typeof setTimeout> | null = null
 let unlistenResize: (() => void) | null = null
 
+// 新增：已缓存的模型 ID 集合（用于判断是否需要显示 loading）
+const loadedModels = ref<Set<string>>(new Set())
+
 const visibleModels = computed(() => 
   config.value?.models.filter(m => m.visible) || []
 )
@@ -48,14 +51,49 @@ async function loadConfig() {
   }
 }
 
-function handleModelClick(model: Model) {
+// 核心改动：使用缓存机制处理模型点击
+async function handleModelClick(model: Model) {
   if (activeModel.value?.id === model.id) return
+  
   activeModel.value = model
-  loadModelInWebview(model.url)
+  
+  // 判断是否为首次加载该模型
+  const isFirstLoad = !loadedModels.value.has(model.id)
+  
+  if (isFirstLoad) {
+    // 首次加载：需要创建 WebView 并显示 loading
+    await loadModelWithCache(model)
+  } else {
+    // 已缓存：先调整大小，再显示（无 loading 动画，瞬间完成）
+    try {
+      // 先获取容器当前位置，确保 WebView 大小正确
+      await new Promise(resolve => setTimeout(resolve, 10))
+      
+      const container = document.getElementById('webview-container')
+      if (container) {
+        const rect = container.getBoundingClientRect()
+        // 调整已缓存的 WebView 到正确位置和大小
+        await tauriAPI.resizeModelWebview(
+          model.id,
+          rect.left,
+          rect.top,
+          rect.width,
+          rect.height
+        )
+      }
+      
+      // 切换到目标模型（显示目标，隐藏其他）
+      await tauriAPI.switchToModel(model.id)
+      webviewLoaded.value = true
+    } catch (error) {
+      console.error('切换模型失败:', error)
+      ElMessage.error('切换模型失败')
+    }
+  }
 }
 
-// 通过 Rust 命令加载网页到右侧 WebView（URL 变化时重建）
-async function loadModelInWebview(url: string) {
+// 使用新缓存 API 加载模型
+async function loadModelWithCache(model: Model) {
   // 清除之前的超时定时器
   if (switchTimeoutTimer) clearTimeout(switchTimeoutTimer)
   
@@ -85,11 +123,27 @@ async function loadModelInWebview(url: string) {
     
     const rect = container.getBoundingClientRect()
     
-    await tauriAPI.loadContentWebview(url, rect.left, rect.top, rect.width, rect.height, config.value?.theme || 'system')
+    // 调用新的缓存 API，返回值表示是否为新创建的 WebView
+    const isNewCreated = await tauriAPI.getOrCreateModelWebview(
+      model.id,
+      model.url,
+      rect.left,
+      rect.top,
+      rect.width,
+      rect.height,
+      config.value?.theme || 'system'
+    )
     
-    // WebView 已创建，但页面内容可能还在加载中
-    // 保持 loading 状态，等待 Rust 侧 on_page_load → webview:page-loaded 事件
-    webviewLoaded.value = true
+    if (isNewCreated) {
+      // 新创建的 WebView：标记为已加载，等待页面加载完成事件
+      loadedModels.value.add(model.id)
+      webviewLoaded.value = true
+      // 保持 loading 状态，等待 Rust 侧 on_page_load → webview:page-loaded 事件
+    } else {
+      // 已缓存的 WebView（理论上不会走到这里，因为前面已经判断过 isFirstLoad）
+      webviewLoaded.value = true
+      modelSwitchState.value = 'idle'
+    }
   } catch (error) {
     if (switchTimeoutTimer) clearTimeout(switchTimeoutTimer)
     console.error('加载 WebView 失败:', error)
@@ -98,25 +152,43 @@ async function loadModelInWebview(url: string) {
   }
 }
 
+// 兼容旧接口已移除，统一使用 loadModelWithCache
+// 保留此函数作为参考，实际请使用 loadModelWithCache
+// async function loadModelInWebview(url: string) { ... }
+
 function retryLoadModel() {
   if (activeModel.value) {
-    loadModelInWebview(activeModel.value.url)
+    // 使用新的缓存 API 重试
+    loadModelWithCache(activeModel.value)
   }
 }
 
 function refreshCurrentModel() {
   if (activeModel.value) {
-    loadModelInWebview(activeModel.value.url)
+    // 刷新当前模型：先从缓存中移除，再重新加载
+    const modelId = activeModel.value.id
+    loadedModels.value.delete(modelId)
+    loadModelWithCache(activeModel.value)
   }
 }
 
-// 仅调整 WebView 位置/大小（不重建，无白屏闪烁）
+// 仅调整当前活动模型 WebView 的位置/大小（不重建，无白屏闪烁）
 async function resizeWebviewOnly() {
   try {
+    if (!activeModel.value) return
+    
     const container = document.getElementById('webview-container')
     if (!container) return
     const rect = container.getBoundingClientRect()
-    await tauriAPI.resizeContentWebview(rect.left, rect.top, rect.width, rect.height)
+    
+    // 使用新的 resizeModelWebview API
+    await tauriAPI.resizeModelWebview(
+      activeModel.value.id,
+      rect.left,
+      rect.top,
+      rect.width,
+      rect.height
+    )
   } catch (error) {
     console.error('调整 WebView 大小失败:', error)
   }
@@ -172,9 +244,11 @@ async function toggleSidebar() {
 
 // 打开设置弹窗
 async function openSettings() {
-  // 隐藏原生 WebView，否则会遮挡 dialog
+  // 隐藏所有模型 WebView（不销毁，仅隐藏），否则会遮挡 dialog
   if (activeModel.value) {
-    await tauriAPI.hideContentWebview()
+    // 使用 switchToModel 传入空字符串来隐藏所有 WebView
+    // 或者直接调用一个"隐藏所有"的命令
+    await tauriAPI.hideAllModelWebviews()
     webviewLoaded.value = false
   }
   settingsVisible.value = true
@@ -183,9 +257,44 @@ async function openSettings() {
 // 关闭设置弹窗
 async function closeSettings() {
   settingsVisible.value = false
-  // 恢复 WebView
-  if (activeModel.value) {
-    loadModelInWebview(activeModel.value.url)
+  
+  if (!activeModel.value || !config.value) {
+    return
+  }
+  
+  // 检查当前活动模型的 WebView 是否还存在（未被清理）
+  const isModelCached = loadedModels.value.has(activeModel.value.id)
+  
+  if (isModelCached) {
+    // 模型已缓存：直接恢复显示并调整大小（无需重新加载）
+    try {
+      await new Promise(resolve => setTimeout(resolve, 10))
+      
+      const container = document.getElementById('webview-container')
+      if (container) {
+        const rect = container.getBoundingClientRect()
+        // 先调整到正确位置和大小
+        await tauriAPI.resizeModelWebview(
+          activeModel.value.id,
+          rect.left,
+          rect.top,
+          rect.width,
+          rect.height
+        )
+      }
+      
+      // 显示该模型的 WebView
+      await tauriAPI.switchToModel(activeModel.value.id)
+      webviewLoaded.value = true
+    } catch (error) {
+      console.error('恢复模型失败:', error)
+      // 如果恢复失败（WebView 可能已被意外销毁），尝试重新加载
+      loadedModels.value.delete(activeModel.value.id)
+      await loadModelWithCache(activeModel.value)
+    }
+  } else {
+    // 模型未缓存：需要重新加载
+    await loadModelWithCache(activeModel.value)
   }
 }
 
@@ -200,7 +309,9 @@ onMounted(async () => {
   })
   
   // 监听窗口大小变化，自动调整 WebView
-  unlistenResize = await getCurrentWindow().onResized(() => {
+  // 注意：Tauri 2.x 使用 onResized 需要导入正确的类型
+  const currentWindow = getCurrentWindow()
+  unlistenResize = await currentWindow.onResized(() => {
     scheduleWebviewResize()
   })
 })
@@ -307,7 +418,7 @@ onBeforeUnmount(() => {
         <!-- WebView 容器 -->
         <div id="webview-container"></div>
         
-        <!-- 模型切换加载过渡层 -->
+        <!-- 模型切换加载过渡层（仅在首次加载或刷新时显示） -->
         <div v-if="modelSwitchState === 'loading'" class="switch-overlay">
           <div class="switch-loading">
             <el-icon class="is-loading" :size="48"><Loading /></el-icon>

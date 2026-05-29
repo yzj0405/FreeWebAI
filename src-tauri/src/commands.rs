@@ -113,20 +113,20 @@ pub async fn toggle_sidebar(app: AppHandle, collapsed: bool) -> Result<(), Strin
     Ok(())
 }
 
-/// 隐藏/移除主窗口内的内容 WebView
+/// 隐藏/移除主窗口内的内容 WebView（兼容旧接口）
 #[tauri::command]
 pub async fn hide_content_webview(app: AppHandle) -> Result<(), String> {
     let window = app.get_window("main").ok_or("主窗口未找到")?;
     let webviews = window.webviews();
     for w in &webviews {
-        if w.label() == "content-webview" {
+        if w.label() == "content-webview" || w.label().starts_with("webview-") {
             let _ = w.close();
         }
     }
     Ok(())
 }
 
-/// 同步主题到内容 WebView（注入 JS 设置 data-theme / dark class / color-scheme）
+/// 同步主题到所有内容 WebView（注入 JS 设置 data-theme / dark class / color-scheme）
 #[tauri::command]
 pub async fn set_webview_theme(app: AppHandle, theme: String) -> Result<(), String> {
     let window = app.get_window("main").ok_or("主窗口未找到")?;
@@ -136,15 +136,14 @@ pub async fn set_webview_theme(app: AppHandle, theme: String) -> Result<(), Stri
     let is_dark = match theme.as_str() {
         "dark" => "true",
         "system" => {
-            // system 模式下，由 WebView 自身的 prefers-color-scheme 决定
-            // 此处移除强制设置，让 WebView 跟随系统
             return Ok(());
         }
         _ => "false",
     };
     
+    // 同步主题到所有模型 WebView
     for w in &webviews {
-        if w.label() == "content-webview" {
+        if w.label() == "content-webview" || w.label().starts_with("webview-") {
             let script = format!(
                 r#"
 (function() {{
@@ -152,30 +151,21 @@ pub async fn set_webview_theme(app: AppHandle, theme: String) -> Result<(), Stri
   var root = document.documentElement;
   var theme = isDark ? 'dark' : 'light';
   
-  // 1. data-theme 属性（大量站点使用）
   root.setAttribute('data-theme', theme);
-  
-  // 2. dark class（Tailwind / Element 等框架使用）
   root.classList.toggle('dark', isDark);
   root.classList.toggle('light', !isDark);
-  
-  // 3. CSS color-scheme 属性
   root.style.colorScheme = isDark ? 'dark' : 'light';
-  
-  // 4. 尝试触发框架的事件（如 next-themes）
   root.dispatchEvent(new CustomEvent('theme-change', {{ detail: {{ theme: theme }} }}));
 }})();
 "#
             );
             let _ = w.eval(&script);
-            return Ok(());
         }
     }
-    // WebView 未找到（可能已关闭），静默忽略
     Ok(())
 }
 
-/// 调整内容 WebView 的位置和大小（不重建，避免白屏闪烁）
+/// 调整所有可见内容 WebView 的位置和大小（不重建）
 #[tauri::command]
 pub async fn resize_content_webview(
     app: AppHandle,
@@ -186,20 +176,22 @@ pub async fn resize_content_webview(
 ) -> Result<(), String> {
     let window = app.get_window("main").ok_or("主窗口未找到")?;
     let webviews = window.webviews();
+    
     for w in &webviews {
-        if w.label() == "content-webview" {
+        // 调整所有模型 WebView 和旧的 content-webview
+        if w.label() == "content-webview" || w.label().starts_with("webview-") {
             w.set_position(tauri::LogicalPosition::new(x, y))
                 .map_err(|e| format!("调整位置失败: {}", e))?;
             w.set_size(tauri::LogicalSize::new(width, height))
                 .map_err(|e| format!("调整大小失败: {}", e))?;
-            return Ok(());
         }
     }
-    // 如果 WebView 不存在，静默忽略
     Ok(())
 }
 
 /// 在主窗口内加载内容 WebView（右侧显示外部网页）
+/// 注意：此命令会销毁旧的 content-webview 并创建新的
+/// 建议使用 get_or_create_model_webview 替代以支持缓存
 #[tauri::command]
 pub async fn load_content_webview(
     app: AppHandle,
@@ -210,9 +202,8 @@ pub async fn load_content_webview(
     height: f64,
     theme: String,
 ) -> Result<(), String> {
-    // 获取主窗口的 Window 对象
     let window = app.get_window("main").ok_or("主窗口未找到")?;
-    
+
     // 遍历已有的 webview，移除 content-webview
     let webviews = window.webviews();
     for w in &webviews {
@@ -220,19 +211,232 @@ pub async fn load_content_webview(
             let _ = w.close();
         }
     }
-    
+
     // 解析 URL
+    let webview_url = url::Url::parse(&url).map_err(|e| format!("URL 解析失败: {}", e))?;
+
+    // 克隆 window 句柄给 on_page_load 回调
+    let window_handle = window.clone();
+
+    // 生成主题注入脚本
+    let init_script = generate_theme_init_script(&theme);
+
+    // 创建新的 WebView builder
+    let mut webview_builder = tauri::webview::WebviewBuilder::new(
+        "content-webview",
+        tauri::WebviewUrl::External(webview_url),
+    ).on_page_load(move |_webview, payload| {
+        use tauri::webview::PageLoadEvent;
+        if payload.event() == PageLoadEvent::Finished {
+            let _ = window_handle.emit("webview:page-loaded", "");
+        }
+    });
+
+    // 注入主题初始化脚本（在页面加载前注册）
+    if !init_script.is_empty() {
+        webview_builder = webview_builder.initialization_script(&init_script);
+    }
+
+    // 作为子视图添加到主窗口
+    window.add_child(
+        webview_builder,
+        tauri::LogicalPosition::new(x, y),
+        tauri::LogicalSize::new(width, height),
+    ).map_err(|e| format!("创建 WebView 失败: {}", e))?;
+
+    Ok(())
+}
+
+/// 获取或创建指定模型的 WebView（支持缓存，避免重复加载）
+/// 核心缓存逻辑：每个模型维护独立的 WebView 实例
+/// 返回值：true 表示新创建的 WebView（需要 loading），false 表示已缓存（无需 loading）
+#[tauri::command]
+pub async fn get_or_create_model_webview(
+    app: AppHandle,
+    model_id: String,
+    url: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    theme: String,
+) -> Result<bool, String> {
+    // 获取主窗口的 Window 对象
+    let window = app.get_window("main").ok_or("主窗口未找到")?;
+    
+    let label = format!("webview-{}", model_id);
+    
+    // ① 检查是否已存在该模型的 WebView（缓存命中）
+    let webviews = window.webviews();
+    for w in &webviews {
+        if w.label() == label {
+            // 已存在：调整位置和大小 + 显示在最上层
+            w.set_position(tauri::LogicalPosition::new(x, y))
+                .map_err(|e| format!("调整位置失败: {}", e))?;
+            w.set_size(tauri::LogicalSize::new(width, height))
+                .map_err(|e| format!("调整大小失败: {}", e))?;
+            
+            // 确保可见（如果之前被隐藏了）
+            let _ = w.show();
+            
+            // 返回 false 表示这是缓存的 WebView（无需 loading 动画）
+            return Ok(false);
+        }
+    }
+    
+    // ② 不存在：创建新 WebView（首次加载）
     let webview_url = url::Url::parse(&url).map_err(|e| format!("URL 解析失败: {}", e))?;
     
     // 克隆 window 句柄给 on_page_load 回调
     let window_handle = window.clone();
     
-    // 生成主题注入脚本（劫持 matchMedia + DOM 标记，双保险）
-    let init_script = match theme.as_str() {
+    // 生成主题注入脚本
+    let init_script = generate_theme_init_script(&theme);
+    
+    // 创建新的 WebView builder
+    let mut webview_builder = tauri::webview::WebviewBuilder::new(
+        &label,
+        tauri::WebviewUrl::External(webview_url),
+    ).on_page_load(move |_webview, payload| {
+        use tauri::webview::PageLoadEvent;
+        if payload.event() == PageLoadEvent::Finished {
+            let _ = window_handle.emit("webview:page-loaded", "");
+        }
+    });
+    
+    // 注入主题初始化脚本
+    if !init_script.is_empty() {
+        webview_builder = webview_builder.initialization_script(&init_script);
+    }
+    
+    // 作为子视图添加到主窗口
+    window.add_child(
+        webview_builder,
+        tauri::LogicalPosition::new(x, y),
+        tauri::LogicalSize::new(width, height),
+    ).map_err(|e| format!("创建 WebView 失败: {}", e))?;
+    
+    // 返回 true 表示这是新创建的 WebView（需要 loading 动画）
+    Ok(true)
+}
+
+/// 切换到指定模型（隐藏其他所有模型 WebView，只显示目标模型）
+#[tauri::command]
+pub async fn switch_to_model(
+    app: AppHandle,
+    model_id: String,
+) -> Result<(), String> {
+    let window = app.get_window("main").ok_or("主窗口未找到")?;
+    
+    let target_label = format!("webview-{}", model_id);
+    
+    // 遍历所有 WebView
+    let webviews = window.webviews();
+    for w in &webviews {
+        // 只处理模型 WebView（标签以 "webview-" 开头）
+        if w.label().starts_with("webview-") {
+            if w.label() == target_label {
+                // 目标 WebView：确保显示并置于最上层
+                let _ = w.show();
+                let _ = w.set_focus();
+            } else {
+                // 其他 WebView：隐藏
+                let _ = w.hide();
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+/// 调整指定模型 WebView 的位置和大小（不重建）
+#[tauri::command]
+pub async fn resize_model_webview(
+    app: AppHandle,
+    model_id: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    let window = app.get_window("main").ok_or("主窗口未找到")?;
+    
+    let label = format!("webview-{}", model_id);
+    let webviews = window.webviews();
+    
+    for w in &webviews {
+        if w.label() == label {
+            w.set_position(tauri::LogicalPosition::new(x, y))
+                .map_err(|e| format!("调整位置失败: {}", e))?;
+            w.set_size(tauri::LogicalSize::new(width, height))
+                .map_err(|e| format!("调整大小失败: {}", e))?;
+            return Ok(());
+        }
+    }
+    
+    // WebView 不存在，静默忽略
+    Ok(())
+}
+
+/// 隐藏/移除指定模型的 WebView
+#[tauri::command]
+pub async fn hide_model_webview(
+    app: AppHandle,
+    model_id: String,
+) -> Result<(), String> {
+    let window = app.get_window("main").ok_or("主窗口未找到")?;
+    
+    let label = format!("webview-{}", model_id);
+    let webviews = window.webviews();
+    
+    for w in &webviews {
+        if w.label() == label {
+            let _ = w.close();
+            return Ok(());
+        }
+    }
+    
+    Ok(())
+}
+
+/// 隐藏所有模型 WebView（不销毁，仅隐藏）- 用于打开设置弹窗时避免遮挡
+#[tauri::command]
+pub async fn hide_all_model_webviews(app: AppHandle) -> Result<(), String> {
+    let window = app.get_window("main").ok_or("主窗口未找到")?;
+    
+    let webviews = window.webviews();
+    for w in &webviews {
+        // 只隐藏模型 WebView（标签以 "webview-" 开头）
+        if w.label().starts_with("webview-") {
+            let _ = w.hide();
+        }
+    }
+    
+    Ok(())
+}
+
+/// 清除所有缓存的模型 WebView（释放内存）
+#[tauri::command]
+pub async fn clear_all_model_webviews(app: AppHandle) -> Result<(), String> {
+    let window = app.get_window("main").ok_or("主窗口未找到")?;
+    
+    let webviews = window.webviews();
+    for w in &webviews {
+        // 只清理模型 WebView（保留其他 WebView 如 content-webview）
+        if w.label().starts_with("webview-") {
+            let _ = w.close();
+        }
+    }
+    
+    Ok(())
+}
+
+/// 生成主题初始化脚本
+fn generate_theme_init_script(theme: &str) -> String {
+    match theme {
         "dark" => r#"
 (function() {
   var isDark = true;
-  // 劫持 matchMedia，在页面 JS 运行前生效
   var _mm = window.matchMedia.bind(window);
   window.matchMedia = function(q) {
     if (q === '(prefers-color-scheme: dark)' || q === '(prefers-color-scheme: light)') {
@@ -244,7 +448,6 @@ pub async fn load_content_webview(
     }
     return _mm(q);
   };
-  // DOM 层面同步
   document.addEventListener('DOMContentLoaded', function() {
     var r = document.documentElement;
     r.setAttribute('data-theme', 'dark');
@@ -276,30 +479,5 @@ pub async fn load_content_webview(
 })();
 "#.to_string(),
         _ => String::new(), // system: 不干预
-    };
-    
-    // 创建新的 WebView builder
-    let mut webview_builder = tauri::webview::WebviewBuilder::new(
-        "content-webview",
-        tauri::WebviewUrl::External(webview_url),
-    ).on_page_load(move |_webview, payload| {
-        use tauri::webview::PageLoadEvent;
-        if payload.event() == PageLoadEvent::Finished {
-            let _ = window_handle.emit("webview:page-loaded", "");
-        }
-    });
-    
-    // 注入主题初始化脚本（在页面加载前注册）
-    if !init_script.is_empty() {
-        webview_builder = webview_builder.initialization_script(&init_script);
     }
-    
-    // 作为子视图添加到主窗口
-    window.add_child(
-        webview_builder,
-        tauri::LogicalPosition::new(x, y),
-        tauri::LogicalSize::new(width, height),
-    ).map_err(|e| format!("创建 WebView 失败: {}", e))?;
-    
-    Ok(())
 }
