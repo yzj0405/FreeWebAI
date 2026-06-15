@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { Setting, Minus, FullScreen, Close, DArrowLeft, DArrowRight, Loading, WarningFilled, Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { tauriAPI, type Model, type AppConfig } from './utils/tauri-api'
@@ -55,13 +55,25 @@ async function loadConfig() {
 async function handleModelClick(model: Model) {
   if (activeModel.value?.id === model.id) return
   
+  // 保存旧的 activeModel id，用于后续隐藏其 WebView
+  const previousModelId = activeModel.value?.id
+  
   activeModel.value = model
   
   // 判断是否为首次加载该模型
   const isFirstLoad = !loadedModels.value.has(model.id)
   
   if (isFirstLoad) {
-    // 首次加载：需要创建 WebView 并显示 loading
+    // 首次加载：先隐藏旧模型的 WebView（让 loading overlay 可见）
+    if (previousModelId && loadedModels.value.has(previousModelId)) {
+      try {
+        await tauriAPI.switchToModel(model.id) // 隐藏所有，显示新的（新 WebView 还不存在，相当于全隐藏）
+        // 实际效果：旧 WebView 被隐藏，loading overlay 现在可见
+      } catch {
+        // 忽略
+      }
+    }
+    // 创建新 WebView 并显示 loading
     await loadModelWithCache(model)
   } else {
     // 已缓存：先调整大小，再显示（无 loading 动画，瞬间完成）
@@ -101,6 +113,11 @@ async function loadModelWithCache(model: Model) {
   modelSwitchError.value = ''
   webviewLoaded.value = false
   
+  // 等待 Vue 渲染 loading overlay（确保 DOM 更新后再创建 WebView）
+  await nextTick()
+  // 额外延迟确保 loading 动画可见（Rust 创建 WebView 后会隐藏它，原生层覆盖 DOM）
+  await new Promise(resolve => setTimeout(resolve, 200))
+  
   // 超时兜底
   switchTimeoutTimer = setTimeout(() => {
     if (modelSwitchState.value === 'loading') {
@@ -135,10 +152,11 @@ async function loadModelWithCache(model: Model) {
     )
     
     if (isNewCreated) {
-      // 新创建的 WebView：标记为已加载，等待页面加载完成事件
+      // 新创建的 WebView：标记为已加载，保持 loading 状态
+      // Rust 侧会在 WebView 创建后立即隐藏它，page-loaded 时才显示
+      // 所以 loading overlay 始终可见，直到 webview:page-loaded 事件触发
       loadedModels.value.add(model.id)
       webviewLoaded.value = true
-      // 保持 loading 状态，等待 Rust 侧 on_page_load → webview:page-loaded 事件
     } else {
       // 已缓存的 WebView（理论上不会走到这里，因为前面已经判断过 isFirstLoad）
       webviewLoaded.value = true
@@ -163,12 +181,19 @@ function retryLoadModel() {
   }
 }
 
-function refreshCurrentModel() {
+async function refreshCurrentModel() {
   if (activeModel.value) {
-    // 刷新当前模型：先从缓存中移除，再重新加载
+    // 刷新当前模型：先销毁旧 WebView，再重新创建
     const modelId = activeModel.value.id
     loadedModels.value.delete(modelId)
-    loadModelWithCache(activeModel.value)
+    // 先销毁旧的 WebView（确保 get_or_create_model_webview 走新建分支）
+    try {
+      await tauriAPI.hideModelWebview(modelId)
+    } catch {
+      // 忽略销毁失败（WebView 可能已不存在）
+    }
+    // 重新创建（会触发 loading 动画 + 页面重新加载）
+    await loadModelWithCache(activeModel.value)
   }
 }
 
@@ -351,7 +376,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="app-container" v-loading="loading">
+  <div class="app-container">
     <!-- 自定义标题栏 -->
     <header class="titlebar">
       <div class="titlebar-left">
@@ -633,6 +658,7 @@ onBeforeUnmount(() => {
   position: absolute;
   top: 0;
   left: 0;
+  background-color: var(--bg-color);
 }
 
 /* 欢迎页面 */

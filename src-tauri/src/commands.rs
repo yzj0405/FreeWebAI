@@ -221,13 +221,23 @@ pub async fn load_content_webview(
     // 生成主题注入脚本
     let init_script = generate_theme_init_script(&theme);
 
+    // 根据主题动态计算 WebView 背景色
+    let bg_color = match theme.as_str() {
+        "dark" => tauri::webview::Color(26, 26, 46, 255),
+        "light" => tauri::webview::Color(255, 255, 255, 255),
+        _ => tauri::webview::Color(26, 26, 46, 255),
+    };
+
     // 创建新的 WebView builder
     let mut webview_builder = tauri::webview::WebviewBuilder::new(
         "content-webview",
         tauri::WebviewUrl::External(webview_url),
-    ).on_page_load(move |_webview, payload| {
+    )
+    .background_color(bg_color)
+    .on_page_load(move |webview, payload| {
         use tauri::webview::PageLoadEvent;
         if payload.event() == PageLoadEvent::Finished {
+            let _ = webview.show();
             let _ = window_handle.emit("webview:page-loaded", "");
         }
     });
@@ -243,6 +253,15 @@ pub async fn load_content_webview(
         tauri::LogicalPosition::new(x, y),
         tauri::LogicalSize::new(width, height),
     ).map_err(|e| format!("创建 WebView 失败: {}", e))?;
+
+    // 立即隐藏 WebView，让 HTML loading overlay 可见
+    let all_webviews = window.webviews();
+    for w in &all_webviews {
+        if w.label() == "content-webview" {
+            let _ = w.hide();
+            break;
+        }
+    }
 
     Ok(())
 }
@@ -293,13 +312,27 @@ pub async fn get_or_create_model_webview(
     // 生成主题注入脚本
     let init_script = generate_theme_init_script(&theme);
     
+    // 根据主题动态计算 WebView 背景色
+    let bg_color = match theme.as_str() {
+        "dark" => tauri::webview::Color(26, 26, 46, 255),     // #1a1a2e
+        "light" => tauri::webview::Color(255, 255, 255, 255), // #ffffff
+        _ => tauri::webview::Color(26, 26, 46, 255),          // system: 默认深色
+    };
+    
     // 创建新的 WebView builder
+    // 关键设计：WebView 创建后立即隐藏，page-loaded 时再显示
+    // 这样 HTML loading overlay 始终可见，不会被原生层覆盖
+    let webview_label = label.clone();
     let mut webview_builder = tauri::webview::WebviewBuilder::new(
         &label,
         tauri::WebviewUrl::External(webview_url),
-    ).on_page_load(move |_webview, payload| {
+    )
+    .background_color(bg_color)
+    .on_page_load(move |webview, payload| {
         use tauri::webview::PageLoadEvent;
         if payload.event() == PageLoadEvent::Finished {
+            // 页面加载完成，显示 WebView（替换 loading overlay）
+            let _ = webview.show();
             let _ = window_handle.emit("webview:page-loaded", "");
         }
     });
@@ -315,6 +348,15 @@ pub async fn get_or_create_model_webview(
         tauri::LogicalPosition::new(x, y),
         tauri::LogicalSize::new(width, height),
     ).map_err(|e| format!("创建 WebView 失败: {}", e))?;
+    
+    // 立即隐藏 WebView，让 HTML loading overlay 完全可见
+    let all_webviews = window.webviews();
+    for w in &all_webviews {
+        if w.label() == webview_label {
+            let _ = w.hide();
+            break;
+        }
+    }
     
     // 返回 true 表示这是新创建的 WebView（需要 loading 动画）
     Ok(true)

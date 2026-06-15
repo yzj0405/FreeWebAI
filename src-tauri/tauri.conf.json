@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "AI Hub Desktop",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "identifier": "com.aihub.desktop",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -23,7 +23,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline' https://unpkg.com; script-src 'self'"
+      "csp": "default-src * 'unsafe-inline' 'unsafe-eval'; script-src * 'unsafe-inline' 'unsafe-eval'; style-src * 'unsafe-inline'; connect-src *; img-src * data:; font-src *"
     }
   },
   "bundle": {
