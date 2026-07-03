@@ -16,6 +16,13 @@ export interface AppConfig {
   models: Model[]
 }
 
+export interface UpdateInfo {
+  latest: string
+  url: string
+  notes: string
+  sha256?: string
+}
+
 export const tauriAPI = {
   // 配置管理
   getConfig: () => invoke<AppConfig>('get_config'),
@@ -77,6 +84,11 @@ export const tauriAPI = {
   // 清除所有缓存的模型 WebView（释放内存）
   clearAllModelWebviews: () =>
     invoke('clear_all_model_webviews'),
+
+  // 应用更新
+  checkForUpdate: () => invoke<UpdateInfo | null>('check_for_update'),
+  downloadUpdate: (updateUrl: string, sha256?: string, autoInstall?: boolean) =>
+    invoke<string>('download_update', { updateUrl, sha256, autoInstall }),
 
   // 主窗口控制
   minimizeWindow: () => {

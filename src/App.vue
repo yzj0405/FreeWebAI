@@ -26,6 +26,7 @@ const SWITCH_TIMEOUT = 15000 // 15秒超时
 
 // WebView 页面加载事件监听器
 let unlistenPageLoaded: UnlistenFn | null = null
+let unlistenLoadFailed: UnlistenFn | null = null
 
 let sidebarTimer: ReturnType<typeof setTimeout> | null = null
 let resizeTimer: ReturnType<typeof setTimeout> | null = null
@@ -33,6 +34,9 @@ let unlistenResize: (() => void) | null = null
 
 // 新增：已缓存的模型 ID 集合（用于判断是否需要显示 loading）
 const loadedModels = ref<Set<string>>(new Set())
+
+// P0-4: 操作版本号，用于取消过期的异步操作
+let loadVersion = 0
 
 const visibleModels = computed(() => 
   config.value?.models.filter(m => m.visible) || []
@@ -54,37 +58,43 @@ async function loadConfig() {
 // 核心改动：使用缓存机制处理模型点击
 async function handleModelClick(model: Model) {
   if (activeModel.value?.id === model.id) return
-  
+
+  // P0-4: 递增版本号，使之前的异步操作失效
+  const version = ++loadVersion
+
   // 保存旧的 activeModel id，用于后续隐藏其 WebView
   const previousModelId = activeModel.value?.id
-  
+
   activeModel.value = model
-  
+
   // 判断是否为首次加载该模型
   const isFirstLoad = !loadedModels.value.has(model.id)
-  
+
   if (isFirstLoad) {
     // 首次加载：先隐藏旧模型的 WebView（让 loading overlay 可见）
     if (previousModelId && loadedModels.value.has(previousModelId)) {
       try {
-        await tauriAPI.switchToModel(model.id) // 隐藏所有，显示新的（新 WebView 还不存在，相当于全隐藏）
-        // 实际效果：旧 WebView 被隐藏，loading overlay 现在可见
+        await tauriAPI.switchToModel(model.id)
       } catch {
         // 忽略
       }
     }
+    // P0-4: 检查版本号是否仍然有效
+    if (loadVersion !== version) return
     // 创建新 WebView 并显示 loading
-    await loadModelWithCache(model)
+    await loadModelWithCache(model, version)
   } else {
     // 已缓存：先调整大小，再显示（无 loading 动画，瞬间完成）
     try {
       // 先获取容器当前位置，确保 WebView 大小正确
       await new Promise(resolve => setTimeout(resolve, 10))
-      
+
+      // P0-4: 检查版本号
+      if (loadVersion !== version) return
+
       const container = document.getElementById('webview-container')
       if (container) {
         const rect = container.getBoundingClientRect()
-        // 调整已缓存的 WebView 到正确位置和大小
         await tauriAPI.resizeModelWebview(
           model.id,
           rect.left,
@@ -93,7 +103,10 @@ async function handleModelClick(model: Model) {
           rect.height
         )
       }
-      
+
+      // P0-4: 再次检查版本号
+      if (loadVersion !== version) return
+
       // 切换到目标模型（显示目标，隐藏其他）
       await tauriAPI.switchToModel(model.id)
       webviewLoaded.value = true
@@ -105,31 +118,41 @@ async function handleModelClick(model: Model) {
 }
 
 // 使用新缓存 API 加载模型
-async function loadModelWithCache(model: Model) {
+async function loadModelWithCache(model: Model, version?: number) {
+  // P1-4: 使用当前版本号，如果没有传入则使用最新
+  const myVersion = version ?? loadVersion
+
   // 清除之前的超时定时器
   if (switchTimeoutTimer) clearTimeout(switchTimeoutTimer)
-  
+
   modelSwitchState.value = 'loading'
   modelSwitchError.value = ''
   webviewLoaded.value = false
-  
+
   // 等待 Vue 渲染 loading overlay（确保 DOM 更新后再创建 WebView）
   await nextTick()
   // 额外延迟确保 loading 动画可见（Rust 创建 WebView 后会隐藏它，原生层覆盖 DOM）
   await new Promise(resolve => setTimeout(resolve, 200))
-  
-  // 超时兜底
+
+  // P0-4: 检查版本号
+  if (loadVersion !== myVersion) return
+
+  // P1-4: 超时兜底 — 保存当前版本号到定时器闭包，避免孤儿定时器误触发
   switchTimeoutTimer = setTimeout(() => {
-    if (modelSwitchState.value === 'loading') {
+    // 只有当版本号仍然匹配且仍在 loading 状态时才触发超时
+    if (loadVersion === myVersion && modelSwitchState.value === 'loading') {
       modelSwitchState.value = 'error'
       modelSwitchError.value = '连接超时，请检查网络后重试'
     }
   }, SWITCH_TIMEOUT)
-  
+
   try {
     // 等待 DOM 更新后获取容器位置
     await new Promise(resolve => setTimeout(resolve, 50))
-    
+
+    // P0-4: 检查版本号
+    if (loadVersion !== myVersion) return
+
     const container = document.getElementById('webview-container')
     if (!container) {
       if (switchTimeoutTimer) clearTimeout(switchTimeoutTimer)
@@ -137,9 +160,9 @@ async function loadModelWithCache(model: Model) {
       modelSwitchError.value = '容器未找到'
       return
     }
-    
+
     const rect = container.getBoundingClientRect()
-    
+
     // 调用新的缓存 API，返回值表示是否为新创建的 WebView
     const isNewCreated = await tauriAPI.getOrCreateModelWebview(
       model.id,
@@ -150,20 +173,22 @@ async function loadModelWithCache(model: Model) {
       rect.height,
       config.value?.theme || 'system'
     )
-    
+
+    // P0-4: 检查版本号
+    if (loadVersion !== myVersion) return
+
     if (isNewCreated) {
       // 新创建的 WebView：标记为已加载，保持 loading 状态
-      // Rust 侧会在 WebView 创建后立即隐藏它，page-loaded 时才显示
-      // 所以 loading overlay 始终可见，直到 webview:page-loaded 事件触发
       loadedModels.value.add(model.id)
       webviewLoaded.value = true
     } else {
-      // 已缓存的 WebView（理论上不会走到这里，因为前面已经判断过 isFirstLoad）
+      // 已缓存的 WebView
       webviewLoaded.value = true
       modelSwitchState.value = 'idle'
     }
   } catch (error) {
     if (switchTimeoutTimer) clearTimeout(switchTimeoutTimer)
+    if (loadVersion !== myVersion) return // P0-4: 过期操作不再处理
     console.error('加载 WebView 失败:', error)
     modelSwitchState.value = 'error'
     modelSwitchError.value = '网页加载失败: ' + (error as Error).message
@@ -330,7 +355,14 @@ onMounted(async () => {
   unlistenPageLoaded = await listen('webview:page-loaded', () => {
     if (switchTimeoutTimer) clearTimeout(switchTimeoutTimer)
     modelSwitchState.value = 'idle'
-    // 主题由 initialization_script 在页面加载时自动应用，无需额外同步
+  })
+
+  // 监听 WebView 页面加载失败事件（Rust 超时保护触发）
+  unlistenLoadFailed = await listen<string>('webview:load-failed', (event) => {
+    console.error('WebView 加载超时:', event.payload)
+    if (switchTimeoutTimer) clearTimeout(switchTimeoutTimer)
+    modelSwitchState.value = 'error'
+    modelSwitchError.value = '页面加载超时，请检查网络后重试'
   })
   
   // 监听窗口大小变化，自动调整 WebView
@@ -372,6 +404,7 @@ onBeforeUnmount(() => {
   if (switchTimeoutTimer) clearTimeout(switchTimeoutTimer)
   if (unlistenResize) unlistenResize()
   if (unlistenPageLoaded) unlistenPageLoaded()
+  if (unlistenLoadFailed) unlistenLoadFailed()
 })
 </script>
 

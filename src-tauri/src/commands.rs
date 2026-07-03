@@ -1,5 +1,14 @@
 use tauri::{AppHandle, Manager, Emitter};
 use crate::config::{self, AppConfig, Model};
+use serde::{Serialize, Deserialize};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// 所有 HTTP 请求的超时时间（秒）
+const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// WebView 页面加载超时时间（秒）
+const PAGE_LOAD_TIMEOUT_SECS: u64 = 30;
 
 /// 获取配置
 #[tauri::command]
@@ -113,13 +122,13 @@ pub async fn toggle_sidebar(app: AppHandle, collapsed: bool) -> Result<(), Strin
     Ok(())
 }
 
-/// 隐藏/移除主窗口内的内容 WebView（兼容旧接口）
+/// 隐藏/移除主窗口内的旧 content-webview（兼容旧接口，不再误杀缓存的模型 WebView）
 #[tauri::command]
 pub async fn hide_content_webview(app: AppHandle) -> Result<(), String> {
     let window = app.get_window("main").ok_or("主窗口未找到")?;
     let webviews = window.webviews();
     for w in &webviews {
-        if w.label() == "content-webview" || w.label().starts_with("webview-") {
+        if w.label() == "content-webview" {
             let _ = w.close();
         }
     }
@@ -228,7 +237,19 @@ pub async fn load_content_webview(
         _ => tauri::webview::Color(26, 26, 46, 255),
     };
 
+    // 加载超时保护
+    let loaded = Arc::new(AtomicBool::new(false));
+    let loaded_clone = loaded.clone();
+    let window_timeout = window.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(PAGE_LOAD_TIMEOUT_SECS)).await;
+        if !loaded_clone.load(Ordering::Relaxed) {
+            let _ = window_timeout.emit("webview:load-failed", "content-webview");
+        }
+    });
+
     // 创建新的 WebView builder
+    let loaded_flag = loaded.clone();
     let mut webview_builder = tauri::webview::WebviewBuilder::new(
         "content-webview",
         tauri::WebviewUrl::External(webview_url),
@@ -237,6 +258,7 @@ pub async fn load_content_webview(
     .on_page_load(move |webview, payload| {
         use tauri::webview::PageLoadEvent;
         if payload.event() == PageLoadEvent::Finished {
+            loaded_flag.store(true, Ordering::Relaxed);
             let _ = webview.show();
             let _ = window_handle.emit("webview:page-loaded", "");
         }
@@ -305,24 +327,37 @@ pub async fn get_or_create_model_webview(
     
     // ② 不存在：创建新 WebView（首次加载）
     let webview_url = url::Url::parse(&url).map_err(|e| format!("URL 解析失败: {}", e))?;
-    
+
     // 克隆 window 句柄给 on_page_load 回调
     let window_handle = window.clone();
-    
+
     // 生成主题注入脚本
     let init_script = generate_theme_init_script(&theme);
-    
+
     // 根据主题动态计算 WebView 背景色
     let bg_color = match theme.as_str() {
         "dark" => tauri::webview::Color(26, 26, 46, 255),     // #1a1a2e
         "light" => tauri::webview::Color(255, 255, 255, 255), // #ffffff
         _ => tauri::webview::Color(26, 26, 46, 255),          // system: 默认深色
     };
-    
+
+    // 加载超时保护：如果 page-loaded 事件在超时时间内未触发，通知前端加载失败
+    let loaded = Arc::new(AtomicBool::new(false));
+    let loaded_clone = loaded.clone();
+    let window_timeout = window.clone();
+    let timeout_model_id = model_id.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(PAGE_LOAD_TIMEOUT_SECS)).await;
+        if !loaded_clone.load(Ordering::Relaxed) {
+            let _ = window_timeout.emit("webview:load-failed", &timeout_model_id);
+        }
+    });
+
     // 创建新的 WebView builder
     // 关键设计：WebView 创建后立即隐藏，page-loaded 时再显示
     // 这样 HTML loading overlay 始终可见，不会被原生层覆盖
     let webview_label = label.clone();
+    let loaded_flag = loaded.clone();
     let mut webview_builder = tauri::webview::WebviewBuilder::new(
         &label,
         tauri::WebviewUrl::External(webview_url),
@@ -332,6 +367,7 @@ pub async fn get_or_create_model_webview(
         use tauri::webview::PageLoadEvent;
         if payload.event() == PageLoadEvent::Finished {
             // 页面加载完成，显示 WebView（替换 loading overlay）
+            loaded_flag.store(true, Ordering::Relaxed);
             let _ = webview.show();
             let _ = window_handle.emit("webview:page-loaded", "");
         }
@@ -471,6 +507,190 @@ pub async fn clear_all_model_webviews(app: AppHandle) -> Result<(), String> {
     }
     
     Ok(())
+}
+
+/// 从 GitHub Releases 自动检查应用更新
+/// 调用 GitHub API 获取最新 Release，与当前版本比对
+/// 无需配置服务器地址，完全自动
+#[tauri::command]
+pub async fn check_for_update(app: AppHandle) -> Result<Option<UpdateInfo>, String> {
+    let current_version = app.package_info().version.to_string();
+    
+    let client = reqwest::Client::builder()
+        .user_agent("AI-Hub-Desktop")
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+
+    let response = client
+        .get("https://api.github.com/repos/yzj0405/FreeWebAI/releases/latest")
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await
+        .map_err(|e| format!("检查更新失败（网络错误）: {}", e))?;
+    
+    if !response.status().is_success() {
+        // 403 可能是 API 频率限制（未认证每小时 60 次）
+        if response.status().as_u16() == 403 {
+            return Err("GitHub API 频率限制，请稍后重试".to_string());
+        }
+        return Err(format!("GitHub 响应错误 ({})", response.status()));
+    }
+    
+    let release: GitHubRelease = response
+        .json()
+        .await
+        .map_err(|_| "解析 GitHub 版本信息失败".to_string())?;
+    
+    // tag_name 去掉 'v' 前缀，如 "v2.1.0" → "2.1.0"
+    let tag = release.tag_name.trim_start_matches('v').to_string();
+    
+    if tag == current_version {
+        return Ok(None);
+    }
+    
+    // 按优先级查找安装包：.exe > .msi
+    let asset = release.assets.iter().find(|a| {
+        let name = a.name.to_lowercase();
+        name.ends_with(".exe")
+    }).or_else(|| {
+        release.assets.iter().find(|a| {
+            a.name.to_lowercase().ends_with(".msi")
+        })
+    });
+    
+    match asset {
+        Some(asset) => Ok(Some(UpdateInfo {
+            latest: tag,
+            url: asset.browser_download_url.clone(),
+            notes: release.body.unwrap_or_default(),
+            sha256: None, // GitHub Releases API 不提供 SHA256
+        })),
+        None => Err("新版本存在，但未找到 Windows 安装包（.exe 或 .msi），请手动下载".to_string()),
+    }
+}
+
+/// 下载更新安装包到临时目录
+/// 如果 auto_install 为 true，下载完成后自动启动安装程序并退出应用
+/// 返回下载文件的本地路径
+#[tauri::command]
+pub async fn download_update(app: AppHandle, update_url: String, sha256: Option<String>, auto_install: Option<bool>) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS * 10)) // 下载用更长超时（5分钟）
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+    let response = client
+        .get(&update_url)
+        .send()
+        .await
+        .map_err(|e| format!("下载失败: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("下载失败，服务器响应 ({})", response.status()));
+    }
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("读取下载内容失败: {}", e))?;
+
+    // SHA256 校验（如果提供了）
+    if let Some(expected_hash) = &sha256 {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let actual_hash = format!("{:x}", hasher.finalize());
+        if !actual_hash.eq_ignore_ascii_case(expected_hash) {
+            return Err(format!(
+                "文件校验失败：下载的文件可能已损坏\n期望: {}\n实际: {}",
+                expected_hash, actual_hash
+            ));
+        }
+    }
+
+    // 决定文件扩展名和类型说明
+    #[cfg(target_os = "windows")]
+    let (ext, _type_name) = (".exe", "Windows 安装程序");
+    #[cfg(target_os = "macos")]
+    let (ext, _type_name) = (".dmg", "macOS 磁盘映像");
+    #[cfg(target_os = "linux")]
+    let (ext, _type_name) = (".deb", "Debian 安装包");
+
+    let file_name = format!("ai_hub_update_v{}{}", app.package_info().version, ext);
+    let tmp_path = std::env::temp_dir().join(&file_name);
+
+    tokio::fs::write(&tmp_path, &bytes)
+        .await
+        .map_err(|e| format!("保存安装包失败: {}", e))?;
+
+    // 自动安装模式：启动安装程序后退出应用
+    if auto_install.unwrap_or(false) {
+        let installer_path = tmp_path.to_string_lossy().to_string();
+
+        // 根据文件类型选择静默安装参数
+        let is_msi = installer_path.to_lowercase().ends_with(".msi");
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::process::Command;
+            let result = if is_msi {
+                // MSI 静默安装：msiexec /i <path> /quiet /norestart
+                Command::new("msiexec")
+                    .args(["/i", &installer_path, "/quiet", "/norestart"])
+                    .spawn()
+            } else {
+                // NSIS 静默安装：/S 区分大小写
+                Command::new(&installer_path)
+                    .arg("/S")
+                    .spawn()
+            };
+
+            match result {
+                Ok(_) => {
+                    // 安装程序已启动，退出当前应用以释放文件锁
+                    // 使用 std::process::exit 避免 Tokio runtime 清理阻塞
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    return Err(format!("启动安装程序失败: {}", e));
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            // 非 Windows 平台暂不支持自动安装，返回路径由前端处理
+            return Ok(installer_path);
+        }
+    }
+
+    Ok(tmp_path.to_string_lossy().to_string())
+}
+
+/// 更新信息结构体（供前端展示和下载使用）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateInfo {
+    pub latest: String,
+    pub url: String,
+    pub notes: String,
+    #[serde(default)]
+    pub sha256: Option<String>,
+}
+
+/// GitHub Release API 响应（只解析需要的字段）
+#[derive(Debug, Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    body: Option<String>,
+    assets: Vec<GitHubAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubAsset {
+    name: String,
+    #[serde(rename = "browser_download_url")]
+    browser_download_url: String,
 }
 
 /// 生成主题初始化脚本

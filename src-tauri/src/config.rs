@@ -239,7 +239,10 @@ pub async fn sync_from_cloud(app: &AppHandle, server_url: String) -> Result<AppC
         format!("{}/model_web.json", base_url)
     };
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
     let response = client
         .get(&fetch_url)
         .header("Accept", "application/json")

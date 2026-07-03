@@ -3,7 +3,7 @@ import { ref, computed, watch, nextTick } from 'vue'
 import { Plus, Refresh, Check } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import Sortable from 'sortablejs'
-import { tauriAPI, type AppConfig, type Model } from '../utils/tauri-api'
+import { tauriAPI, type AppConfig, type Model, type UpdateInfo } from '../utils/tauri-api'
 import { applyTheme, type ThemeMode } from '../utils/theme'
 
 const props = defineProps<{
@@ -27,6 +27,14 @@ const editingModel = ref<Model | null>(null)
 const isEditDialog = ref(false)
 const tableRef = ref()
 const sortableInstance = ref<Sortable | null>(null)
+
+// 应用更新相关状态
+const currentVersion = ref('')
+const isCheckingUpdate = ref(false)
+const isDownloading = ref(false)
+const updateInfo = ref<UpdateInfo | null>(null)
+const updateCheckDone = ref(false)
+const downloadProgress = ref(0)
 
 // 深拷贝配置
 watch(() => props.config, (newConfig) => {
@@ -232,6 +240,92 @@ async function checkAllModels() {
     isCheckingAll.value = false
   }
 }
+
+// 获取当前版本号（从 package.json 在构建时注入）
+// 使用 Vite 的 import.meta 特性获取版本
+currentVersion.value = __APP_VERSION__
+
+// 检查应用更新
+async function handleCheckUpdate() {
+  isCheckingUpdate.value = true
+  updateCheckDone.value = false
+  updateInfo.value = null
+
+  try {
+    const result = await tauriAPI.checkForUpdate()
+    updateCheckDone.value = true
+
+    if (result) {
+      updateInfo.value = result
+      ElMessage.success(`发现新版本 v${result.latest}`)
+    } else {
+      ElMessage.success('当前已是最新版本')
+    }
+  } catch (error) {
+    ElMessage.error('检查更新失败: ' + (error as string))
+    updateCheckDone.value = true
+  } finally {
+    isCheckingUpdate.value = false
+  }
+}
+
+// 下载并安装更新
+async function handleDownloadUpdate() {
+  if (!updateInfo.value) return
+
+  try {
+    await ElMessageBox.confirm(
+      `即将下载并安装 v${updateInfo.value.latest}，安装过程中应用会自动关闭并重启。\n\n更新日志：\n${updateInfo.value.notes || '无'}`,
+      '下载并安装更新',
+      {
+        confirmButtonText: '立即更新',
+        cancelButtonText: '取消',
+        type: 'info',
+      }
+    )
+  } catch {
+    return // 用户取消
+  }
+
+  isDownloading.value = true
+  downloadProgress.value = 0
+
+  try {
+    // 模拟下载进度（实际下载由 Rust 后端处理，无进度回调）
+    const progressTimer = setInterval(() => {
+      if (downloadProgress.value < 90) {
+        downloadProgress.value += Math.random() * 15
+      }
+    }, 500)
+
+    // autoInstall = true：Rust 下载完成后自动启动安装程序并退出应用
+    await tauriAPI.downloadUpdate(
+      updateInfo.value.url,
+      updateInfo.value.sha256,
+      true  // 自动安装
+    )
+
+    clearInterval(progressTimer)
+    downloadProgress.value = 100
+
+    // 如果执行到这里，说明自动安装未生效（非 Windows 平台），回退到手动打开
+    ElMessage.success('下载完成，即将打开安装程序')
+  } catch (error) {
+    ElMessage.error('下载失败: ' + (error as string))
+  } finally {
+    isDownloading.value = false
+    downloadProgress.value = 0
+  }
+}
+
+// 打开 GitHub Releases 页面（手动下载）
+function openReleasesPage() {
+  import('@tauri-apps/plugin-opener').then(({ openUrl }) => {
+    openUrl('https://github.com/yzj0405/FreeWebAI/releases/latest')
+  }).catch(() => {
+    window.open('https://github.com/yzj0405/FreeWebAI/releases/latest', '_blank')
+  })
+}
 </script>
 
 <template>
@@ -253,6 +347,67 @@ async function checkAllModels() {
           <el-radio-button value="system">跟随系统</el-radio-button>
         </el-radio-group>
       </el-form-item>
+
+      <!-- 应用更新 -->
+      <div class="update-section">
+        <div class="section-header">
+          <h3>应用更新</h3>
+        </div>
+        <div class="update-info-row">
+          <span class="update-label">当前版本：</span>
+          <span class="update-value">v{{ currentVersion }}</span>
+          <el-button
+            size="small"
+            :loading="isCheckingUpdate"
+            @click="handleCheckUpdate"
+            style="margin-left: auto"
+          >
+            <el-icon><Refresh /></el-icon>
+            检查更新
+          </el-button>
+        </div>
+
+        <!-- 发现新版本 -->
+        <div v-if="updateInfo" class="update-available">
+          <el-alert
+            :title="`发现新版本 v${updateInfo.latest}`"
+            type="success"
+            :closable="false"
+            show-icon
+          >
+            <template #default>
+              <div class="update-notes" v-if="updateInfo.notes">{{ updateInfo.notes }}</div>
+            </template>
+          </el-alert>
+          <div class="update-actions">
+            <el-button
+              type="primary"
+              :loading="isDownloading"
+              @click="handleDownloadUpdate"
+            >
+              <template v-if="isDownloading">
+                下载中 {{ Math.round(downloadProgress) }}%
+              </template>
+              <template v-else>
+                下载并安装
+              </template>
+            </el-button>
+            <el-button @click="openReleasesPage">手动下载</el-button>
+          </div>
+          <el-progress
+            v-if="isDownloading"
+            :percentage="Math.round(downloadProgress)"
+            :stroke-width="6"
+            :show-text="false"
+            style="margin-top: 8px"
+          />
+        </div>
+
+        <!-- 已是最新版本 -->
+        <div v-else-if="updateCheckDone && !updateInfo" class="update-latest">
+          <el-alert title="当前已是最新版本" type="info" :closable="false" show-icon />
+        </div>
+      </div>
 
       <!-- 云端同步 -->
       <el-form-item label="服务器地址">
@@ -436,6 +591,52 @@ async function checkAllModels() {
 .action-buttons .el-button {
   margin: 0;
   white-space: nowrap;
+}
+
+/* 应用更新区域 */
+.update-section {
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.update-info-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.update-label {
+  font-size: 14px;
+  color: var(--el-text-color-regular);
+}
+
+.update-value {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--el-text-color-primary);
+}
+
+.update-available {
+  margin-top: 12px;
+}
+
+.update-notes {
+  font-size: 13px;
+  color: var(--el-text-color-regular);
+  white-space: pre-line;
+  margin-top: 4px;
+}
+
+.update-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.update-latest {
+  margin-top: 12px;
 }
 
 /* SortableJS 拖拽样式 */

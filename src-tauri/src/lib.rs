@@ -28,6 +28,9 @@ pub fn run() {
             commands::hide_model_webview,
             commands::hide_all_model_webviews,
             commands::clear_all_model_webviews,
+            // 应用更新
+            commands::check_for_update,
+            commands::download_update,
         ])
         .setup(|app| {
             // 初始化配置
