@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
+use crate::ReqwestClient;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -184,15 +184,15 @@ pub fn get_default_config() -> AppConfig {
     }
 }
 
-/// 读取配置文件
-pub fn read_config(app: &AppHandle) -> AppConfig {
+/// 读取配置文件（异步，不阻塞 Tokio 线程池）
+pub async fn read_config(app: &AppHandle) -> AppConfig {
     let config_path = get_config_path(app);
-    
+
     if !config_path.exists() {
         return get_default_config();
     }
 
-    match fs::read_to_string(&config_path) {
+    match tokio::fs::read_to_string(&config_path).await {
         Ok(content) => {
             match serde_json::from_str(&content) {
                 Ok(config) => config,
@@ -203,26 +203,35 @@ pub fn read_config(app: &AppHandle) -> AppConfig {
     }
 }
 
-/// 写入配置文件
-pub fn write_config(app: &AppHandle, config: &AppConfig) -> Result<(), String> {
+/// 写入配置文件（异步，不阻塞 Tokio 线程池）
+pub async fn write_config(app: &AppHandle, config: &AppConfig) -> Result<(), String> {
     let config_path = get_config_path(app);
-    
+
     if let Some(parent) = config_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        tokio::fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
     }
 
     let content = serde_json::to_string_pretty(config)
         .map_err(|e| format!("序列化配置失败: {}", e))?;
 
-    fs::write(&config_path, content)
+    tokio::fs::write(&config_path, content).await
         .map_err(|e| format!("写入配置文件失败: {}", e))?;
 
     Ok(())
 }
 
-/// 初始化配置
+/// 初始化配置（同步，仅在 setup 中调用）
+/// 只确保配置目录和默认配置文件存在
 pub fn init_config(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
-    let _ = read_config(app);
+    let config_path = get_config_path(app);
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if !config_path.exists() {
+        let default_config = get_default_config();
+        let content = serde_json::to_string_pretty(&default_config)?;
+        std::fs::write(&config_path, content)?;
+    }
     Ok(())
 }
 
@@ -239,10 +248,7 @@ pub async fn sync_from_cloud(app: &AppHandle, server_url: String) -> Result<AppC
         format!("{}/model_web.json", base_url)
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+    let client = app.state::<ReqwestClient>().0.clone();
     let response = client
         .get(&fetch_url)
         .header("Accept", "application/json")
@@ -263,7 +269,7 @@ pub async fn sync_from_cloud(app: &AppHandle, server_url: String) -> Result<AppC
         .as_array()
         .ok_or("数据格式错误: 缺少 models 数组".to_string())?;
 
-    let local_config = read_config(app);
+    let local_config = read_config(app).await;
     let local_models = &local_config.models;
 
     // 构建本地模型映射
@@ -325,7 +331,7 @@ pub async fn sync_from_cloud(app: &AppHandle, server_url: String) -> Result<AppC
     };
 
     // 保存合并后的配置
-    write_config(app, &merged_config)?;
+    write_config(app, &merged_config).await?;
 
     Ok(merged_config)
 }

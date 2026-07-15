@@ -85,6 +85,10 @@ export const tauriAPI = {
   clearAllModelWebviews: () =>
     invoke('clear_all_model_webviews'),
 
+  // 移除指定模型的 WebView（删除模型时调用）
+  removeModelWebview: (modelId: string) =>
+    invoke('remove_model_webview', { modelId }),
+
   // 应用更新
   checkForUpdate: () => invoke<UpdateInfo | null>('check_for_update'),
   downloadUpdate: (updateUrl: string, sha256?: string, autoInstall?: boolean) =>
