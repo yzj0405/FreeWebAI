@@ -307,7 +307,33 @@ async function openSettings() {
 // 关闭设置弹窗
 async function closeSettings() {
   settingsVisible.value = false
-  
+
+  if (!config.value) return
+
+  // 重新加载配置以获取最新模型列表
+  await loadConfig()
+
+  if (!config.value) return
+  const newModelIds = new Set(config.value.models.map(m => m.id))
+
+  // 检测被删除的模型，清理对应的缓存 WebView
+  for (const cachedId of loadedModels.value) {
+    if (!newModelIds.has(cachedId)) {
+      // 模型已被删除，清理 WebView
+      try {
+        await tauriAPI.removeModelWebview(cachedId)
+      } catch {
+        // 忽略清理失败
+      }
+      loadedModels.value.delete(cachedId)
+      // 如果当前活跃模型被删除，清空
+      if (activeModel.value?.id === cachedId) {
+        activeModel.value = null
+        webviewLoaded.value = false
+      }
+    }
+  }
+
   if (!activeModel.value || !config.value) {
     return
   }

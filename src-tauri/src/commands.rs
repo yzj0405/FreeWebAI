@@ -1,26 +1,71 @@
 use tauri::{AppHandle, Manager, Emitter};
 use crate::config::{self, AppConfig, Model};
+use crate::ReqwestClient;
 use serde::{Serialize, Deserialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use std::collections::VecDeque;
+use std::sync::Mutex as StdMutex;
+use tokio::sync::Mutex as TokioMutex;
 
 /// 所有 HTTP 请求的超时时间（秒）
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 /// WebView 页面加载超时时间（秒）
 const PAGE_LOAD_TIMEOUT_SECS: u64 = 30;
+/// WebView 缓存上限
+const MAX_CACHED_WEBVIEWS: usize = 5;
+
+/// LRU 缓存队列：队首为最近使用，队尾为最久未使用
+static LRU_CACHE: StdMutex<VecDeque<String>> = StdMutex::new(VecDeque::new());
+/// WebView 创建互斥锁，防止并发创建导致标签冲突
+static WEBVIEW_CREATE_MUTEX: TokioMutex<()> = TokioMutex::const_new(());
+
+// ==================== LRU 缓存辅助函数 ====================
+
+/// 将模型移到 LRU 队首（最近使用）
+fn lru_touch(model_id: &str) {
+    if let Ok(mut lru) = LRU_CACHE.lock() {
+        lru.retain(|id| id != model_id);
+        lru.push_front(model_id.to_string());
+    }
+}
+
+/// 从 LRU 队列移除指定模型
+fn lru_remove(model_id: &str) {
+    if let Ok(mut lru) = LRU_CACHE.lock() {
+        lru.retain(|id| id != model_id);
+    }
+}
+
+/// 从 LRU 队尾取出最久未使用的模型 ID
+fn lru_pop_back() -> Option<String> {
+    LRU_CACHE.lock().ok()?.pop_back()
+}
+
+/// 获取当前 LRU 缓存数量
+fn lru_len() -> usize {
+    LRU_CACHE.lock().map(|l| l.len()).unwrap_or(0)
+}
+
+/// 清空 LRU 队列
+fn lru_clear() {
+    if let Ok(mut lru) = LRU_CACHE.lock() {
+        lru.clear();
+    }
+}
 
 /// 获取配置
 #[tauri::command]
 pub async fn get_config(app: AppHandle) -> Result<AppConfig, String> {
-    let config = config::read_config(&app);
+    let config = config::read_config(&app).await;
     Ok(config)
 }
 
 /// 保存配置
 #[tauri::command]
 pub async fn save_config(app: AppHandle, config: AppConfig) -> Result<(), String> {
-    config::write_config(&app, &config)?;
+    config::write_config(&app, &config).await?;
     
     // 通知前端配置已更新
     if let Some(window) = app.get_webview_window("main") {
@@ -116,9 +161,9 @@ pub fn close_window(window: tauri::Window) {
 /// 切换侧边栏折叠状态
 #[tauri::command]
 pub async fn toggle_sidebar(app: AppHandle, collapsed: bool) -> Result<(), String> {
-    let mut config = config::read_config(&app);
+    let mut config = config::read_config(&app).await;
     config.sidebar_collapsed = collapsed;
-    config::write_config(&app, &config)?;
+    config::write_config(&app, &config).await?;
     Ok(())
 }
 
@@ -306,22 +351,39 @@ pub async fn get_or_create_model_webview(
     let window = app.get_window("main").ok_or("主窗口未找到")?;
     
     let label = format!("webview-{}", model_id);
-    
-    // ① 检查是否已存在该模型的 WebView（缓存命中）
-    let webviews = window.webviews();
-    for w in &webviews {
-        if w.label() == label {
-            // 已存在：调整位置和大小 + 显示在最上层
-            w.set_position(tauri::LogicalPosition::new(x, y))
-                .map_err(|e| format!("调整位置失败: {}", e))?;
-            w.set_size(tauri::LogicalSize::new(width, height))
-                .map_err(|e| format!("调整大小失败: {}", e))?;
-            
-            // 确保可见（如果之前被隐藏了）
-            let _ = w.show();
-            
-            // 返回 false 表示这是缓存的 WebView（无需 loading 动画）
-            return Ok(false);
+
+    // ① 快速路径：WebView 已存在（无锁检查）
+    {
+        let webviews = window.webviews();
+        for w in &webviews {
+            if w.label() == label {
+                w.set_position(tauri::LogicalPosition::new(x, y))
+                    .map_err(|e| format!("调整位置失败: {}", e))?;
+                w.set_size(tauri::LogicalSize::new(width, height))
+                    .map_err(|e| format!("调整大小失败: {}", e))?;
+                let _ = w.show();
+                lru_touch(&model_id); // 更新 LRU 位置
+                return Ok(false);
+            }
+        }
+    }
+
+    // ② 慢路径：需要创建，获取互斥锁
+    let _guard = WEBVIEW_CREATE_MUTEX.lock().await;
+
+    // ③ 双重检查：锁内再次确认 WebView 不存在
+    {
+        let webviews = window.webviews();
+        for w in &webviews {
+            if w.label() == label {
+                w.set_position(tauri::LogicalPosition::new(x, y))
+                    .map_err(|e| format!("调整位置失败: {}", e))?;
+                w.set_size(tauri::LogicalSize::new(width, height))
+                    .map_err(|e| format!("调整大小失败: {}", e))?;
+                let _ = w.show();
+                lru_touch(&model_id);
+                return Ok(false);
+            }
         }
     }
     
@@ -393,7 +455,26 @@ pub async fn get_or_create_model_webview(
             break;
         }
     }
-    
+
+    // LRU：插入新创建的模型
+    lru_touch(&model_id);
+
+    // LRU：淘汰超限的 WebView
+    while lru_len() > MAX_CACHED_WEBVIEWS {
+        if let Some(evict_id) = lru_pop_back() {
+            let evict_label = format!("webview-{}", evict_id);
+            let all_wv = window.webviews();
+            for w in &all_wv {
+                if w.label() == evict_label {
+                    let _ = w.close();
+                    break;
+                }
+            }
+        } else {
+            break;
+        }
+    }
+
     // 返回 true 表示这是新创建的 WebView（需要 loading 动画）
     Ok(true)
 }
@@ -407,7 +488,10 @@ pub async fn switch_to_model(
     let window = app.get_window("main").ok_or("主窗口未找到")?;
     
     let target_label = format!("webview-{}", model_id);
-    
+
+    // 更新 LRU 位置
+    lru_touch(&model_id);
+
     // 遍历所有 WebView
     let webviews = window.webviews();
     for w in &webviews {
@@ -497,15 +581,39 @@ pub async fn hide_all_model_webviews(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub async fn clear_all_model_webviews(app: AppHandle) -> Result<(), String> {
     let window = app.get_window("main").ok_or("主窗口未找到")?;
-    
+
     let webviews = window.webviews();
     for w in &webviews {
-        // 只清理模型 WebView（保留其他 WebView 如 content-webview）
         if w.label().starts_with("webview-") {
             let _ = w.close();
         }
     }
-    
+
+    // 清空 LRU 队列
+    lru_clear();
+
+    Ok(())
+}
+
+/// 移除指定模型的 WebView（销毁 + 从 LRU 移除）
+/// 用于设置中删除模型时清理对应的缓存 WebView
+#[tauri::command]
+pub async fn remove_model_webview(app: AppHandle, model_id: String) -> Result<(), String> {
+    let window = app.get_window("main").ok_or("主窗口未找到")?;
+    let label = format!("webview-{}", model_id);
+
+    // 销毁 WebView
+    let webviews = window.webviews();
+    for w in &webviews {
+        if w.label() == label {
+            let _ = w.close();
+            break;
+        }
+    }
+
+    // 从 LRU 移除
+    lru_remove(&model_id);
+
     Ok(())
 }
 
@@ -515,12 +623,8 @@ pub async fn clear_all_model_webviews(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub async fn check_for_update(app: AppHandle) -> Result<Option<UpdateInfo>, String> {
     let current_version = app.package_info().version.to_string();
-    
-    let client = reqwest::Client::builder()
-        .user_agent("AI-Hub-Desktop")
-        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+
+    let client = app.state::<ReqwestClient>().0.clone();
 
     let response = client
         .get("https://api.github.com/repos/yzj0405/FreeWebAI/releases/latest")
@@ -576,12 +680,10 @@ pub async fn check_for_update(app: AppHandle) -> Result<Option<UpdateInfo>, Stri
 /// 返回下载文件的本地路径
 #[tauri::command]
 pub async fn download_update(app: AppHandle, update_url: String, sha256: Option<String>, auto_install: Option<bool>) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS * 10)) // 下载用更长超时（5分钟）
-        .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+    let client = app.state::<ReqwestClient>().0.clone();
     let response = client
         .get(&update_url)
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS * 10)) // 下载用更长超时（5分钟）
         .send()
         .await
         .map_err(|e| format!("下载失败: {}", e))?;

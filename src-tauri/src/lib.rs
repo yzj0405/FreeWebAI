@@ -2,6 +2,12 @@
 mod config;
 mod commands;
 
+use std::time::Duration;
+use tauri::Manager;
+
+/// 全局共享的 HTTP 客户端包装结构体
+pub struct ReqwestClient(pub reqwest::Client);
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -28,11 +34,19 @@ pub fn run() {
             commands::hide_model_webview,
             commands::hide_all_model_webviews,
             commands::clear_all_model_webviews,
+            commands::remove_model_webview,
             // 应用更新
             commands::check_for_update,
             commands::download_update,
         ])
         .setup(|app| {
+            // 创建全局共享的 HTTP 客户端（30s 超时）
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("Failed to create HTTP client");
+            app.manage(ReqwestClient(client));
+
             // 初始化配置
             config::init_config(app.handle())?;
             Ok(())
