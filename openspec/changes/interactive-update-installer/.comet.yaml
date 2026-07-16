@@ -1,0 +1,11 @@
+change: interactive-update-installer
+phase: build
+schema: full
+created: "2026-07-02"
+language: zh-CN
+design_doc: docs/superpowers/specs/2026-07-02-interactive-update-installer-design.md
+plan: docs/superpowers/plans/2026-07-02-interactive-update-installer.md
+isolation: branch
+build_mode: executing-plans
+tdd_mode: direct
+review_mode: off

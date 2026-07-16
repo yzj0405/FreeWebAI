@@ -275,7 +275,7 @@ async function handleDownloadUpdate() {
 
   try {
     await ElMessageBox.confirm(
-      `即将下载并安装 v${updateInfo.value.latest}，安装过程中应用会自动关闭并重启。\n\n更新日志：\n${updateInfo.value.notes || '无'}`,
+      `即将下载 v${updateInfo.value.latest}，下载完成后将打开安装程序。\n\n应用会自动关闭，请手动完成安装后重新启动应用。\n\n更新日志：\n${updateInfo.value.notes || '无'}`,
       '下载并安装更新',
       {
         confirmButtonText: '立即更新',

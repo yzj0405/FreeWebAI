@@ -737,14 +737,13 @@ pub async fn download_update(app: AppHandle, update_url: String, sha256: Option<
         {
             use std::process::Command;
             let result = if is_msi {
-                // MSI 静默安装：msiexec /i <path> /quiet /norestart
+                // MSI 安装：打开安装向导
                 Command::new("msiexec")
-                    .args(["/i", &installer_path, "/quiet", "/norestart"])
+                    .args(["/i", &installer_path])
                     .spawn()
             } else {
-                // NSIS 静默安装：/S 区分大小写
+                // NSIS 安装：打开安装向导（非静默模式）
                 Command::new(&installer_path)
-                    .arg("/S")
                     .spawn()
             };
 
