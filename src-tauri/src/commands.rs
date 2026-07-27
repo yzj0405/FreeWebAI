@@ -617,62 +617,113 @@ pub async fn remove_model_webview(app: AppHandle, model_id: String) -> Result<()
     Ok(())
 }
 
-/// 从 GitHub Releases 自动检查应用更新
-/// 调用 GitHub API 获取最新 Release，与当前版本比对
-/// 无需配置服务器地址，完全自动
+/// GitHub 仓库标识（用于构造 Releases URL）
+const GITHUB_REPO: &str = "yzj0405/FreeWebAI";
+/// 已知的安装包文件名模式（优先级从高到低）
+const INSTALLER_EXTENSIONS: &[&str] = &[".exe", ".msi"];
+
+/// 从 GitHub Releases 检查应用更新
+/// 使用重定向方式获取版本号，避免 API 频率限制
+/// 下载 URL 使用已知文件名模式构造直链，无需 API
 #[tauri::command]
 pub async fn check_for_update(app: AppHandle) -> Result<Option<UpdateInfo>, String> {
     let current_version = app.package_info().version.to_string();
-
     let client = app.state::<ReqwestClient>().0.clone();
 
-    let response = client
-        .get("https://api.github.com/repos/yzj0405/FreeWebAI/releases/latest")
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
+    // ① 使用 /releases/latest 重定向提取最新版本号（无 API 频率限制）
+    //    GitHub 会 302 重定向到 /releases/tag/v{version}
+    let no_redirect_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+
+    let response = no_redirect_client
+        .get(format!("https://github.com/{}/releases/latest", GITHUB_REPO))
         .send()
         .await
         .map_err(|e| format!("检查更新失败（网络错误）: {}", e))?;
-    
-    if !response.status().is_success() {
-        // 403 可能是 API 频率限制（未认证每小时 60 次）
-        if response.status().as_u16() == 403 {
-            return Err("GitHub API 频率限制，请稍后重试".to_string());
+
+    let status = response.status();
+    let tag = if status.is_redirection() {
+        // 从 Location 头提取版本号
+        // Location: https://github.com/yzj0405/FreeWebAI/releases/tag/v2.0.5
+        response
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|loc| loc.rsplit('/').next())
+            .map(|t| t.trim_start_matches('v').to_string())
+    } else {
+        None
+    };
+
+    // 如果重定向方式失败，降级到 API（仅一次请求）
+    let tag = match tag {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            let api_response = client
+                .get(format!(
+                    "https://api.github.com/repos/{}/releases/latest",
+                    GITHUB_REPO
+                ))
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .send()
+                .await
+                .map_err(|e| format!("检查更新失败（网络错误）: {}", e))?;
+
+            if !api_response.status().is_success() {
+                return Err(format!(
+                    "检查更新失败（GitHub 响应 {}），请稍后重试",
+                    api_response.status()
+                ));
+            }
+
+            let release: GitHubRelease = api_response
+                .json()
+                .await
+                .map_err(|_| "解析 GitHub 版本信息失败".to_string())?;
+
+            release.tag_name.trim_start_matches('v').to_string()
         }
-        return Err(format!("GitHub 响应错误 ({})", response.status()));
-    }
-    
-    let release: GitHubRelease = response
-        .json()
-        .await
-        .map_err(|_| "解析 GitHub 版本信息失败".to_string())?;
-    
-    // tag_name 去掉 'v' 前缀，如 "v2.1.0" → "2.1.0"
-    let tag = release.tag_name.trim_start_matches('v').to_string();
-    
+    };
+
     if tag == current_version {
         return Ok(None);
     }
-    
-    // 按优先级查找安装包：.exe > .msi
-    let asset = release.assets.iter().find(|a| {
-        let name = a.name.to_lowercase();
-        name.ends_with(".exe")
-    }).or_else(|| {
-        release.assets.iter().find(|a| {
-            a.name.to_lowercase().ends_with(".msi")
-        })
-    });
-    
-    match asset {
-        Some(asset) => Ok(Some(UpdateInfo {
-            latest: tag,
-            url: asset.browser_download_url.clone(),
-            notes: release.body.unwrap_or_default(),
-            sha256: None, // GitHub Releases API 不提供 SHA256
-        })),
-        None => Err("新版本存在，但未找到 Windows 安装包（.exe 或 .msi），请手动下载".to_string()),
-    }
+
+    // ② 构造下载 URL：使用已知文件名模式，无需 API 获取 asset 列表
+    let base_url = format!(
+        "https://github.com/{}/releases/download/v{}",
+        GITHUB_REPO, tag
+    );
+    let download_url = INSTALLER_EXTENSIONS
+        .iter()
+        .map(|ext| format!("{}/ai_hub_setup_v{}{}", base_url, tag, ext))
+        .next()
+        .unwrap_or_else(|| format!("{}/ai_hub_setup_v{}.exe", base_url, tag));
+
+    // ③ 尝试从 Release 页面获取更新日志（非关键，失败不影响更新检测）
+    let notes = match client
+        .get(format!(
+            "https://api.github.com/repos/{}/releases/tags/v{}",
+            GITHUB_REPO, tag
+        ))
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+    {
+        Ok(resp) => resp.json::<GitHubRelease>().await.ok().and_then(|r| r.body).unwrap_or_default(),
+        Err(_) => String::new(),
+    };
+
+    Ok(Some(UpdateInfo {
+        latest: tag,
+        url: download_url,
+        notes,
+        sha256: None,
+    }))
 }
 
 /// 下载更新安装包到临时目录
@@ -689,7 +740,12 @@ pub async fn download_update(app: AppHandle, update_url: String, sha256: Option<
         .map_err(|e| format!("下载失败: {}", e))?;
 
     if !response.status().is_success() {
-        return Err(format!("下载失败，服务器响应 ({})", response.status()));
+        let status = response.status().as_u16();
+        return Err(match status {
+            404 => "下载失败：安装包文件不存在，请检查发布页面是否有新版本安装包".to_string(),
+            403 => "下载失败：访问被拒绝（GitHub 速率限制），请稍后重试".to_string(),
+            _ => format!("下载失败，服务器响应 ({})", response.status()),
+        });
     }
 
     let bytes = response
