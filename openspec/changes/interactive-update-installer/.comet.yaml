@@ -1,5 +1,5 @@
 change: interactive-update-installer
-phase: build
+phase: archive
 schema: full
 created: "2026-07-02"
 language: zh-CN
@@ -9,3 +9,6 @@ isolation: branch
 build_mode: executing-plans
 tdd_mode: direct
 review_mode: off
+verification_report: docs/superpowers/reports/2026-07-02-interactive-update-installer-verify.md
+branch_status: handled
+verify_result: pass

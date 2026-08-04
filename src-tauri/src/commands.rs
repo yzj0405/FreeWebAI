@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::collections::VecDeque;
 use std::sync::Mutex as StdMutex;
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{Mutex as TokioMutex, oneshot};
 
 /// 所有 HTTP 请求的超时时间（秒）
 const REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -53,6 +53,21 @@ fn lru_clear() {
     if let Ok(mut lru) = LRU_CACHE.lock() {
         lru.clear();
     }
+}
+
+/// 在主线程上执行闭包并返回结果（通过 oneshot 通道同步）
+/// Tauri 2.x 中，窗口/WebView 状态变更 API 必须在主线程执行
+async fn run_on_main_thread<F, T>(app: &AppHandle, f: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = oneshot::channel();
+    app.run_on_main_thread(move || {
+        let result = f();
+        let _ = tx.send(result);
+    }).map_err(|e| format!("调度主线程任务失败: {}", e))?;
+    rx.await.map_err(|_| "主线程通道已关闭".to_string())?
 }
 
 /// 获取配置
@@ -111,26 +126,32 @@ pub async fn open_model_window(app: AppHandle, model: Model) -> Result<(), Strin
     let window_label = format!("model_{}", model.id);
 
     // 检查窗口是否已存在
-    if app.get_webview_window(&window_label).is_some() {
-        // 窗口已存在，聚焦到该窗口
-        if let Some(window) = app.get_webview_window(&window_label) {
+    if let Some(window) = app.get_webview_window(&window_label) {
+        // 窗口已存在，聚焦到该窗口（窗口状态变更必须在主线程）
+        run_on_main_thread(&app, move || {
             let _ = window.show();
             let _ = window.set_focus();
-        }
+            Ok::<(), String>(())
+        }).await?;
         return Ok(());
     }
 
-    // 创建新窗口
-    let _window = tauri::WebviewWindowBuilder::new(&app, &window_label, tauri::WebviewUrl::External(url::Url::parse(&model.url).map_err(|e| e.to_string())?))
-        .title(&model.name)
-        .inner_size(1200.0, 800.0)
-        .min_inner_size(800.0, 600.0)
-        .build()
-        .map_err(|e| e.to_string())?;
+    // 解析 URL
+    let url = url::Url::parse(&model.url).map_err(|e| e.to_string())?;
+    let model_name = model.name.clone();
+    let app_clone = app.clone();
 
-    // 设置 User-Agent（伪装为标准 Chrome）
-    // 注意：Tauri 2.x 中 User-Agent 设置可能因平台而异
-    
+    // 创建新窗口（必须在主线程执行）
+    run_on_main_thread(&app, move || {
+        let _window = tauri::WebviewWindowBuilder::new(&app_clone, &window_label, tauri::WebviewUrl::External(url))
+            .title(&model_name)
+            .inner_size(1200.0, 800.0)
+            .min_inner_size(800.0, 600.0)
+            .build()
+            .map_err(|e| e.to_string())?;
+        Ok::<(), String>(())
+    }).await?;
+
     Ok(())
 }
 
@@ -171,12 +192,17 @@ pub async fn toggle_sidebar(app: AppHandle, collapsed: bool) -> Result<(), Strin
 #[tauri::command]
 pub async fn hide_content_webview(app: AppHandle) -> Result<(), String> {
     let window = app.get_window("main").ok_or("主窗口未找到")?;
-    let webviews = window.webviews();
-    for w in &webviews {
-        if w.label() == "content-webview" {
-            let _ = w.close();
+
+    run_on_main_thread(&app, move || {
+        let webviews = window.webviews();
+        for w in &webviews {
+            if w.label() == "content-webview" {
+                let _ = w.close();
+            }
         }
-    }
+        Ok::<(), String>(())
+    }).await?;
+
     Ok(())
 }
 
@@ -184,7 +210,6 @@ pub async fn hide_content_webview(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub async fn set_webview_theme(app: AppHandle, theme: String) -> Result<(), String> {
     let window = app.get_window("main").ok_or("主窗口未找到")?;
-    let webviews = window.webviews();
     
     // 确定是否为深色
     let is_dark = match theme.as_str() {
@@ -194,12 +219,10 @@ pub async fn set_webview_theme(app: AppHandle, theme: String) -> Result<(), Stri
         }
         _ => "false",
     };
-    
-    // 同步主题到所有模型 WebView
-    for w in &webviews {
-        if w.label() == "content-webview" || w.label().starts_with("webview-") {
-            let script = format!(
-                r#"
+
+    // 预生成主题脚本（所有 WebView 使用相同脚本）
+    let script = format!(
+        r#"
 (function() {{
   var isDark = {is_dark};
   var root = document.documentElement;
@@ -212,10 +235,19 @@ pub async fn set_webview_theme(app: AppHandle, theme: String) -> Result<(), Stri
   root.dispatchEvent(new CustomEvent('theme-change', {{ detail: {{ theme: theme }} }}));
 }})();
 "#
-            );
-            let _ = w.eval(&script);
+    );
+
+    // WebView eval 必须在主线程执行
+    run_on_main_thread(&app, move || {
+        let webviews = window.webviews();
+        for w in &webviews {
+            if w.label() == "content-webview" || w.label().starts_with("webview-") {
+                let _ = w.eval(&script);
+            }
         }
-    }
+        Ok::<(), String>(())
+    }).await?;
+
     Ok(())
 }
 
@@ -229,18 +261,19 @@ pub async fn resize_content_webview(
     height: f64,
 ) -> Result<(), String> {
     let window = app.get_window("main").ok_or("主窗口未找到")?;
-    let webviews = window.webviews();
-    
-    for w in &webviews {
-        // 调整所有模型 WebView 和旧的 content-webview
-        if w.label() == "content-webview" || w.label().starts_with("webview-") {
-            w.set_position(tauri::LogicalPosition::new(x, y))
-                .map_err(|e| format!("调整位置失败: {}", e))?;
-            w.set_size(tauri::LogicalSize::new(width, height))
-                .map_err(|e| format!("调整大小失败: {}", e))?;
+
+    run_on_main_thread(&app, move || {
+        let webviews = window.webviews();
+        for w in &webviews {
+            if w.label() == "content-webview" || w.label().starts_with("webview-") {
+                w.set_position(tauri::LogicalPosition::new(x, y))
+                    .map_err(|e| format!("调整位置失败: {}", e))?;
+                w.set_size(tauri::LogicalSize::new(width, height))
+                    .map_err(|e| format!("调整大小失败: {}", e))?;
+            }
         }
-    }
-    Ok(())
+        Ok::<(), String>(())
+    }).await
 }
 
 /// 在主窗口内加载内容 WebView（右侧显示外部网页）
@@ -258,19 +291,12 @@ pub async fn load_content_webview(
 ) -> Result<(), String> {
     let window = app.get_window("main").ok_or("主窗口未找到")?;
 
-    // 遍历已有的 webview，移除 content-webview
-    let webviews = window.webviews();
-    for w in &webviews {
-        if w.label() == "content-webview" {
-            let _ = w.close();
-        }
-    }
+    // 克隆 window 句柄供后续使用（必须在 move 之前）
+    let window_handle = window.clone();
+    let window_timeout = window.clone();
 
     // 解析 URL
     let webview_url = url::Url::parse(&url).map_err(|e| format!("URL 解析失败: {}", e))?;
-
-    // 克隆 window 句柄给 on_page_load 回调
-    let window_handle = window.clone();
 
     // 生成主题注入脚本
     let init_script = generate_theme_init_script(&theme);
@@ -285,7 +311,6 @@ pub async fn load_content_webview(
     // 加载超时保护
     let loaded = Arc::new(AtomicBool::new(false));
     let loaded_clone = loaded.clone();
-    let window_timeout = window.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(PAGE_LOAD_TIMEOUT_SECS)).await;
         if !loaded_clone.load(Ordering::Relaxed) {
@@ -293,7 +318,7 @@ pub async fn load_content_webview(
         }
     });
 
-    // 创建新的 WebView builder
+    // 创建新的 WebView builder（配置在任意线程完成）
     let loaded_flag = loaded.clone();
     let mut webview_builder = tauri::webview::WebviewBuilder::new(
         "content-webview",
@@ -309,26 +334,38 @@ pub async fn load_content_webview(
         }
     });
 
-    // 注入主题初始化脚本（在页面加载前注册）
     if !init_script.is_empty() {
         webview_builder = webview_builder.initialization_script(&init_script);
     }
 
-    // 作为子视图添加到主窗口
-    window.add_child(
-        webview_builder,
-        tauri::LogicalPosition::new(x, y),
-        tauri::LogicalSize::new(width, height),
-    ).map_err(|e| format!("创建 WebView 失败: {}", e))?;
-
-    // 立即隐藏 WebView，让 HTML loading overlay 可见
-    let all_webviews = window.webviews();
-    for w in &all_webviews {
-        if w.label() == "content-webview" {
-            let _ = w.hide();
-            break;
+    // 以下窗口操作必须在主线程执行
+    run_on_main_thread(&app, move || {
+        // 1. 移除旧的 content-webview
+        let webviews = window.webviews();
+        for w in &webviews {
+            if w.label() == "content-webview" {
+                let _ = w.close();
+            }
         }
-    }
+
+        // 2. 添加新的 WebView 子视图
+        window.add_child(
+            webview_builder,
+            tauri::LogicalPosition::new(x, y),
+            tauri::LogicalSize::new(width, height),
+        ).map_err(|e| format!("创建 WebView 失败: {}", e))?;
+
+        // 3. 立即隐藏 WebView，让 HTML loading overlay 可见
+        let all_webviews = window.webviews();
+        for w in &all_webviews {
+            if w.label() == "content-webview" {
+                let _ = w.hide();
+                break;
+            }
+        }
+
+        Ok::<(), String>(())
+    }).await?;
 
     Ok(())
 }
@@ -347,63 +384,49 @@ pub async fn get_or_create_model_webview(
     height: f64,
     theme: String,
 ) -> Result<bool, String> {
-    // 获取主窗口的 Window 对象
     let window = app.get_window("main").ok_or("主窗口未找到")?;
-    
     let label = format!("webview-{}", model_id);
 
-    // ① 快速路径：WebView 已存在（无锁检查）
-    {
-        let webviews = window.webviews();
-        for w in &webviews {
-            if w.label() == label {
-                w.set_position(tauri::LogicalPosition::new(x, y))
-                    .map_err(|e| format!("调整位置失败: {}", e))?;
-                w.set_size(tauri::LogicalSize::new(width, height))
-                    .map_err(|e| format!("调整大小失败: {}", e))?;
-                let _ = w.show();
-                lru_touch(&model_id); // 更新 LRU 位置
-                return Ok(false);
+    // ① 快速路径：在主线程检查 WebView 是否已存在
+    let window_for_check = window.clone();
+    let found = run_on_main_thread(&app, {
+        let label = label.clone();
+        let model_id = model_id.clone();
+        move || -> Result<bool, String> {
+            let webviews = window_for_check.webviews();
+            for w in &webviews {
+                if w.label() == label {
+                    w.set_position(tauri::LogicalPosition::new(x, y))
+                        .map_err(|e| format!("调整位置失败: {}", e))?;
+                    w.set_size(tauri::LogicalSize::new(width, height))
+                        .map_err(|e| format!("调整大小失败: {}", e))?;
+                    let _ = w.show();
+                    lru_touch(&model_id);
+                    return Ok(true);
+                }
             }
+            Ok(false)
         }
+    }).await?;
+
+    if found {
+        return Ok(false); // false = 已缓存
     }
 
-    // ② 慢路径：需要创建，获取互斥锁
+    // ② 慢路径：获取互斥锁
     let _guard = WEBVIEW_CREATE_MUTEX.lock().await;
 
-    // ③ 双重检查：锁内再次确认 WebView 不存在
-    {
-        let webviews = window.webviews();
-        for w in &webviews {
-            if w.label() == label {
-                w.set_position(tauri::LogicalPosition::new(x, y))
-                    .map_err(|e| format!("调整位置失败: {}", e))?;
-                w.set_size(tauri::LogicalSize::new(width, height))
-                    .map_err(|e| format!("调整大小失败: {}", e))?;
-                let _ = w.show();
-                lru_touch(&model_id);
-                return Ok(false);
-            }
-        }
-    }
-    
-    // ② 不存在：创建新 WebView（首次加载）
+    // 准备创建新 WebView 的异步安全操作
     let webview_url = url::Url::parse(&url).map_err(|e| format!("URL 解析失败: {}", e))?;
-
-    // 克隆 window 句柄给 on_page_load 回调
     let window_handle = window.clone();
-
-    // 生成主题注入脚本
     let init_script = generate_theme_init_script(&theme);
-
-    // 根据主题动态计算 WebView 背景色
     let bg_color = match theme.as_str() {
-        "dark" => tauri::webview::Color(26, 26, 46, 255),     // #1a1a2e
-        "light" => tauri::webview::Color(255, 255, 255, 255), // #ffffff
-        _ => tauri::webview::Color(26, 26, 46, 255),          // system: 默认深色
+        "dark" => tauri::webview::Color(26, 26, 46, 255),
+        "light" => tauri::webview::Color(255, 255, 255, 255),
+        _ => tauri::webview::Color(26, 26, 46, 255),
     };
 
-    // 加载超时保护：如果 page-loaded 事件在超时时间内未触发，通知前端加载失败
+    // 超时保护
     let loaded = Arc::new(AtomicBool::new(false));
     let loaded_clone = loaded.clone();
     let window_timeout = window.clone();
@@ -415,9 +438,7 @@ pub async fn get_or_create_model_webview(
         }
     });
 
-    // 创建新的 WebView builder
-    // 关键设计：WebView 创建后立即隐藏，page-loaded 时再显示
-    // 这样 HTML loading overlay 始终可见，不会被原生层覆盖
+    // 创建 WebView builder（配置可在任意线程完成）
     let webview_label = label.clone();
     let loaded_flag = loaded.clone();
     let mut webview_builder = tauri::webview::WebviewBuilder::new(
@@ -428,55 +449,82 @@ pub async fn get_or_create_model_webview(
     .on_page_load(move |webview, payload| {
         use tauri::webview::PageLoadEvent;
         if payload.event() == PageLoadEvent::Finished {
-            // 页面加载完成，显示 WebView（替换 loading overlay）
             loaded_flag.store(true, Ordering::Relaxed);
             let _ = webview.show();
             let _ = window_handle.emit("webview:page-loaded", "");
         }
     });
-    
-    // 注入主题初始化脚本
+
     if !init_script.is_empty() {
         webview_builder = webview_builder.initialization_script(&init_script);
     }
-    
-    // 作为子视图添加到主窗口
-    window.add_child(
-        webview_builder,
-        tauri::LogicalPosition::new(x, y),
-        tauri::LogicalSize::new(width, height),
-    ).map_err(|e| format!("创建 WebView 失败: {}", e))?;
-    
-    // 立即隐藏 WebView，让 HTML loading overlay 完全可见
-    let all_webviews = window.webviews();
-    for w in &all_webviews {
-        if w.label() == webview_label {
-            let _ = w.hide();
-            break;
-        }
-    }
 
-    // LRU：插入新创建的模型
-    lru_touch(&model_id);
+    // ③ 双重检查 + 创建：在主线程执行所有窗口操作
+    let created = run_on_main_thread(&app, {
+        let label = label.clone();
+        let model_id = model_id.clone();
+        let webview_label = webview_label.clone();
+        let window = window.clone();
+        let webview_builder = webview_builder;
+        move || -> Result<bool, String> {
+            // ③-a 锁内再次确认 WebView 不存在
+            let webviews = window.webviews();
+            for w in &webviews {
+                if w.label() == label {
+                    w.set_position(tauri::LogicalPosition::new(x, y))
+                        .map_err(|e| format!("调整位置失败: {}", e))?;
+                    w.set_size(tauri::LogicalSize::new(width, height))
+                        .map_err(|e| format!("调整大小失败: {}", e))?;
+                    let _ = w.show();
+                    lru_touch(&model_id);
+                    return Ok(false); // 已存在
+                }
+            }
 
-    // LRU：淘汰超限的 WebView
-    while lru_len() > MAX_CACHED_WEBVIEWS {
-        if let Some(evict_id) = lru_pop_back() {
-            let evict_label = format!("webview-{}", evict_id);
-            let all_wv = window.webviews();
-            for w in &all_wv {
-                if w.label() == evict_label {
-                    let _ = w.close();
+            // ③-b 创建新 WebView
+            window.add_child(
+                webview_builder,
+                tauri::LogicalPosition::new(x, y),
+                tauri::LogicalSize::new(width, height),
+            ).map_err(|e| format!("创建 WebView 失败: {}", e))?;
+
+            // 立即隐藏 WebView
+            let all_webviews = window.webviews();
+            for w in &all_webviews {
+                if w.label() == webview_label {
+                    let _ = w.hide();
                     break;
                 }
             }
-        } else {
-            break;
-        }
-    }
 
-    // 返回 true 表示这是新创建的 WebView（需要 loading 动画）
-    Ok(true)
+            // LRU：插入新创建的模型
+            lru_touch(&model_id);
+
+            // LRU：淘汰超限的 WebView
+            while lru_len() > MAX_CACHED_WEBVIEWS {
+                if let Some(evict_id) = lru_pop_back() {
+                    let evict_label = format!("webview-{}", evict_id);
+                    let all_wv = window.webviews();
+                    for w in &all_wv {
+                        if w.label() == evict_label {
+                            let _ = w.close();
+                            break;
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            Ok(true) // 新创建
+        }
+    }).await?;
+
+    if created {
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 /// 切换到指定模型（隐藏其他所有模型 WebView，只显示目标模型）
@@ -492,21 +540,21 @@ pub async fn switch_to_model(
     // 更新 LRU 位置
     lru_touch(&model_id);
 
-    // 遍历所有 WebView
-    let webviews = window.webviews();
-    for w in &webviews {
-        // 只处理模型 WebView（标签以 "webview-" 开头）
-        if w.label().starts_with("webview-") {
-            if w.label() == target_label {
-                // 目标 WebView：确保显示并置于最上层
-                let _ = w.show();
-                let _ = w.set_focus();
-            } else {
-                // 其他 WebView：隐藏
-                let _ = w.hide();
+    // 窗口状态变更必须在主线程执行
+    run_on_main_thread(&app, move || {
+        let webviews = window.webviews();
+        for w in &webviews {
+            if w.label().starts_with("webview-") {
+                if w.label() == target_label {
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                } else {
+                    let _ = w.hide();
+                }
             }
         }
-    }
+        Ok::<(), String>(())
+    }).await?;
     
     Ok(())
 }
@@ -522,22 +570,21 @@ pub async fn resize_model_webview(
     height: f64,
 ) -> Result<(), String> {
     let window = app.get_window("main").ok_or("主窗口未找到")?;
-    
     let label = format!("webview-{}", model_id);
-    let webviews = window.webviews();
-    
-    for w in &webviews {
-        if w.label() == label {
-            w.set_position(tauri::LogicalPosition::new(x, y))
-                .map_err(|e| format!("调整位置失败: {}", e))?;
-            w.set_size(tauri::LogicalSize::new(width, height))
-                .map_err(|e| format!("调整大小失败: {}", e))?;
-            return Ok(());
+
+    run_on_main_thread(&app, move || {
+        let webviews = window.webviews();
+        for w in &webviews {
+            if w.label() == label {
+                w.set_position(tauri::LogicalPosition::new(x, y))
+                    .map_err(|e| format!("调整位置失败: {}", e))?;
+                w.set_size(tauri::LogicalSize::new(width, height))
+                    .map_err(|e| format!("调整大小失败: {}", e))?;
+                break;
+            }
         }
-    }
-    
-    // WebView 不存在，静默忽略
-    Ok(())
+        Ok::<(), String>(())
+    }).await
 }
 
 /// 隐藏/移除指定模型的 WebView
@@ -547,17 +594,19 @@ pub async fn hide_model_webview(
     model_id: String,
 ) -> Result<(), String> {
     let window = app.get_window("main").ok_or("主窗口未找到")?;
-    
     let label = format!("webview-{}", model_id);
-    let webviews = window.webviews();
-    
-    for w in &webviews {
-        if w.label() == label {
-            let _ = w.close();
-            return Ok(());
+
+    run_on_main_thread(&app, move || {
+        let webviews = window.webviews();
+        for w in &webviews {
+            if w.label() == label {
+                let _ = w.close();
+                break;
+            }
         }
-    }
-    
+        Ok::<(), String>(())
+    }).await?;
+
     Ok(())
 }
 
@@ -565,15 +614,17 @@ pub async fn hide_model_webview(
 #[tauri::command]
 pub async fn hide_all_model_webviews(app: AppHandle) -> Result<(), String> {
     let window = app.get_window("main").ok_or("主窗口未找到")?;
-    
-    let webviews = window.webviews();
-    for w in &webviews {
-        // 只隐藏模型 WebView（标签以 "webview-" 开头）
-        if w.label().starts_with("webview-") {
-            let _ = w.hide();
+
+    run_on_main_thread(&app, move || {
+        let webviews = window.webviews();
+        for w in &webviews {
+            if w.label().starts_with("webview-") {
+                let _ = w.hide();
+            }
         }
-    }
-    
+        Ok::<(), String>(())
+    }).await?;
+
     Ok(())
 }
 
@@ -582,12 +633,15 @@ pub async fn hide_all_model_webviews(app: AppHandle) -> Result<(), String> {
 pub async fn clear_all_model_webviews(app: AppHandle) -> Result<(), String> {
     let window = app.get_window("main").ok_or("主窗口未找到")?;
 
-    let webviews = window.webviews();
-    for w in &webviews {
-        if w.label().starts_with("webview-") {
-            let _ = w.close();
+    run_on_main_thread(&app, move || {
+        let webviews = window.webviews();
+        for w in &webviews {
+            if w.label().starts_with("webview-") {
+                let _ = w.close();
+            }
         }
-    }
+        Ok::<(), String>(())
+    }).await?;
 
     // 清空 LRU 队列
     lru_clear();
@@ -602,14 +656,16 @@ pub async fn remove_model_webview(app: AppHandle, model_id: String) -> Result<()
     let window = app.get_window("main").ok_or("主窗口未找到")?;
     let label = format!("webview-{}", model_id);
 
-    // 销毁 WebView
-    let webviews = window.webviews();
-    for w in &webviews {
-        if w.label() == label {
-            let _ = w.close();
-            break;
+    run_on_main_thread(&app, move || {
+        let webviews = window.webviews();
+        for w in &webviews {
+            if w.label() == label {
+                let _ = w.close();
+                break;
+            }
         }
-    }
+        Ok::<(), String>(())
+    }).await?;
 
     // 从 LRU 移除
     lru_remove(&model_id);
@@ -619,8 +675,39 @@ pub async fn remove_model_webview(app: AppHandle, model_id: String) -> Result<()
 
 /// GitHub 仓库标识（用于构造 Releases URL）
 const GITHUB_REPO: &str = "yzj0405/FreeWebAI";
-/// 已知的安装包文件名模式（优先级从高到低）
-const INSTALLER_EXTENSIONS: &[&str] = &[".exe", ".msi"];
+/// Tauri 配置中的 productName（与 tauri.conf.json 保持一致）
+const TAURI_PRODUCT_NAME: &str = "AI Hub Desktop";
+/// 目标架构
+const TAURI_ARCH: &str = "x64";
+
+/// 根据 Tauri bundler 命名规则构造安装包文件名
+/// NSIS: {ProductName}_{version}_{arch}-setup.exe
+/// MSI:  {ProductName}_{version}_{arch}_en-US.msi
+fn build_installer_filename(version: &str, ext: &str) -> String {
+    let product = TAURI_PRODUCT_NAME.replace(' ', ".");
+    match ext {
+        ".msi" => format!("{}_{}_{}_en-US{}", product, version, TAURI_ARCH, ext),
+        _ => format!("{}_{}_{}-setup{}", product, version, TAURI_ARCH, ext),
+    }
+}
+
+/// 根据 Tauri bundler 命名规则构造下载 URL
+fn build_download_url(tag: &str) -> String {
+    let base = format!(
+        "https://github.com/{}/releases/download/v{}",
+        GITHUB_REPO, tag
+    );
+    // 返回 NSIS 安装包 URL（Windows 首选）
+    let filename = build_installer_filename(tag, ".exe");
+    format!("{}/{}", base, filename)
+}
+
+/// 从 GitHub Release 的 assets 列表中查找 .exe 安装包的下载 URL
+fn extract_asset_url(release: &GitHubRelease) -> Option<String> {
+    release.assets.iter()
+        .find(|a| a.name.ends_with(".exe"))
+        .map(|a| a.browser_download_url.clone())
+}
 
 /// 从 GitHub Releases 检查应用更新
 /// 使用重定向方式获取版本号，避免 API 频率限制
@@ -693,19 +780,11 @@ pub async fn check_for_update(app: AppHandle) -> Result<Option<UpdateInfo>, Stri
         return Ok(None);
     }
 
-    // ② 构造下载 URL：使用已知文件名模式，无需 API 获取 asset 列表
-    let base_url = format!(
-        "https://github.com/{}/releases/download/v{}",
-        GITHUB_REPO, tag
-    );
-    let download_url = INSTALLER_EXTENSIONS
-        .iter()
-        .map(|ext| format!("{}/ai_hub_setup_v{}{}", base_url, tag, ext))
-        .next()
-        .unwrap_or_else(|| format!("{}/ai_hub_setup_v{}.exe", base_url, tag));
+    // ② 构造下载 URL：先按 Tauri bundler 规则构造，再尝试用 API 获取真实 asset URL
+    let constructed_url = build_download_url(&tag);
 
-    // ③ 尝试从 Release 页面获取更新日志（非关键，失败不影响更新检测）
-    let notes = match client
+    // ③ 尝试从 Release API 获取更新日志和真实下载 URL（非关键，失败不影响更新检测）
+    let (notes, download_url, sha256) = match client
         .get(format!(
             "https://api.github.com/repos/{}/releases/tags/v{}",
             GITHUB_REPO, tag
@@ -714,15 +793,28 @@ pub async fn check_for_update(app: AppHandle) -> Result<Option<UpdateInfo>, Stri
         .send()
         .await
     {
-        Ok(resp) => resp.json::<GitHubRelease>().await.ok().and_then(|r| r.body).unwrap_or_default(),
-        Err(_) => String::new(),
+        Ok(resp) => {
+            if let Ok(release) = resp.json::<GitHubRelease>().await {
+                let notes = release.body.clone().unwrap_or_default();
+                // 优先使用 API 返回的真实 asset URL
+                let asset_url = extract_asset_url(&release).unwrap_or_else(|| constructed_url.clone());
+                // 尝试提取 SHA256（如果有 digest 字段）
+                let sha256 = release.assets.iter()
+                    .find(|a| a.name.ends_with(".exe"))
+                    .and_then(|a| a.digest.clone());
+                (notes, asset_url, sha256)
+            } else {
+                (String::new(), constructed_url, None)
+            }
+        }
+        Err(_) => (String::new(), constructed_url, None),
     };
 
     Ok(Some(UpdateInfo {
         latest: tag,
         url: download_url,
         notes,
-        sha256: None,
+        sha256,
     }))
 }
 
@@ -848,6 +940,8 @@ struct GitHubAsset {
     name: String,
     #[serde(rename = "browser_download_url")]
     browser_download_url: String,
+    #[serde(default)]
+    digest: Option<String>,
 }
 
 /// 生成主题初始化脚本

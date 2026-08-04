@@ -1,6 +1,6 @@
 [package]
 name = "ai-hub-desktop"
-version = "2.0.6"
+version = "2.0.8"
 description = "A Tauri App"
 authors = ["yy"]
 edition = "2021"
@@ -29,3 +29,10 @@ dirs = "5.0"
 url = "2.5"
 sha2 = "0.10"
 
+# 增加DEBUG设置
+[profile.dev]
+debug = true
+split-debuginfo = "packed" # 针对 Windows 平台，确保 PDB 符号表完整
+
+[profile.release]
+debug = true # 如果在 Release 下测试，也建议开启

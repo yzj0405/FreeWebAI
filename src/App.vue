@@ -38,6 +38,9 @@ const loadedModels = ref<Set<string>>(new Set())
 // P0-4: 操作版本号，用于取消过期的异步操作
 let loadVersion = 0
 
+// 模型加载锁：防止快速点击时的重复操作
+let loadingModelId: string | null = null
+
 const visibleModels = computed(() => 
   config.value?.models.filter(m => m.visible) || []
 )
@@ -59,16 +62,39 @@ async function loadConfig() {
 async function handleModelClick(model: Model) {
   if (activeModel.value?.id === model.id) return
 
+  // 防抖：如果正在加载同一个模型，忽略
+  if (loadingModelId === model.id) return
+
+  // 如果正在加载其他模型，允许切换但记录状态
+  // loadingModelId 会在操作完成后清空
+
   // P0-4: 递增版本号，使之前的异步操作失效
   const version = ++loadVersion
+  
+  // 标记正在加载
+  loadingModelId = model.id
 
   // 保存旧的 activeModel id，用于后续隐藏其 WebView
   const previousModelId = activeModel.value?.id
 
-  activeModel.value = model
-
   // 判断是否为首次加载该模型
   const isFirstLoad = !loadedModels.value.has(model.id)
+
+  // 立即更新 UI 显示（但不立即设置 activeModel，以避免在加载失败时显示错误内容）
+  // 这里只更新 loading 状态
+  modelSwitchState.value = 'loading'
+  modelSwitchError.value = ''
+  
+  // 清除之前的超时定时器
+  if (switchTimeoutTimer) clearTimeout(switchTimeoutTimer)
+  
+  // 设置超时保护
+  switchTimeoutTimer = setTimeout(() => {
+    if (loadVersion === version && modelSwitchState.value === 'loading') {
+      modelSwitchState.value = 'error'
+      modelSwitchError.value = '连接超时，请检查网络后重试'
+    }
+  }, SWITCH_TIMEOUT)
 
   if (isFirstLoad) {
     // 首次加载：先隐藏旧模型的 WebView（让 loading overlay 可见）
@@ -80,9 +106,14 @@ async function handleModelClick(model: Model) {
       }
     }
     // P0-4: 检查版本号是否仍然有效
-    if (loadVersion !== version) return
+    if (loadVersion !== version) {
+      loadingModelId = null // 清除锁
+      return
+    }
     // 创建新 WebView 并显示 loading
     await loadModelWithCache(model, version)
+    // 加载完成后清除锁
+    if (loadVersion === version) loadingModelId = null
   } else {
     // 已缓存：先调整大小，再显示（无 loading 动画，瞬间完成）
     try {
@@ -90,7 +121,10 @@ async function handleModelClick(model: Model) {
       await new Promise(resolve => setTimeout(resolve, 10))
 
       // P0-4: 检查版本号
-      if (loadVersion !== version) return
+      if (loadVersion !== version) {
+        loadingModelId = null
+        return
+      }
 
       const container = document.getElementById('webview-container')
       if (container) {
@@ -105,14 +139,29 @@ async function handleModelClick(model: Model) {
       }
 
       // P0-4: 再次检查版本号
-      if (loadVersion !== version) return
+      if (loadVersion !== version) {
+        loadingModelId = null
+        return
+      }
 
       // 切换到目标模型（显示目标，隐藏其他）
       await tauriAPI.switchToModel(model.id)
-      webviewLoaded.value = true
+      
+      // 只有版本号仍然匹配时才更新状态
+      if (loadVersion === version) {
+        activeModel.value = model
+        webviewLoaded.value = true
+        modelSwitchState.value = 'idle'
+        if (switchTimeoutTimer) clearTimeout(switchTimeoutTimer)
+      }
     } catch (error) {
       console.error('切换模型失败:', error)
-      ElMessage.error('切换模型失败')
+      if (loadVersion === version) {
+        modelSwitchState.value = 'error'
+        modelSwitchError.value = '切换模型失败: ' + (error as Error).message
+      }
+    } finally {
+      if (loadVersion === version) loadingModelId = null
     }
   }
 }
@@ -185,6 +234,11 @@ async function loadModelWithCache(model: Model, version?: number) {
       // 已缓存的 WebView
       webviewLoaded.value = true
       modelSwitchState.value = 'idle'
+    }
+    
+    // 加载成功后更新 activeModel
+    if (loadVersion === myVersion) {
+      activeModel.value = model
     }
   } catch (error) {
     if (switchTimeoutTimer) clearTimeout(switchTimeoutTimer)
