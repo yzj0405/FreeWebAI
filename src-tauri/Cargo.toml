@@ -1,0 +1,40 @@
+[package]
+name = "ai-hub-desktop"
+version = "2.0.9"
+description = "A Tauri App"
+authors = ["yy"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "ai_hub_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["unstable"] }
+tauri-plugin-opener = "2"
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+dirs = "5.0"
+url = "2.5"
+sha2 = "0.10"
+
+# 增加DEBUG设置
+[profile.dev]
+debug = true
+split-debuginfo = "packed" # 针对 Windows 平台，确保 PDB 符号表完整
+
+[profile.release]
+debug = true # 如果在 Release 下测试，也建议开启
+split-debuginfo = "packed" # 强制 Windows 端生成最完整的 .pdb 符号文件
+opt-level = 0              # 禁止编译器优化代码结构
