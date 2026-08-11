@@ -1,6 +1,6 @@
 [package]
 name = "ai-hub-desktop"
-version = "2.0.8"
+version = "2.0.9"
 description = "A Tauri App"
 authors = ["yy"]
 edition = "2021"
@@ -36,3 +36,5 @@ split-debuginfo = "packed" # 针对 Windows 平台，确保 PDB 符号表完整
 
 [profile.release]
 debug = true # 如果在 Release 下测试，也建议开启
+split-debuginfo = "packed" # 强制 Windows 端生成最完整的 .pdb 符号文件
+opt-level = 0              # 禁止编译器优化代码结构

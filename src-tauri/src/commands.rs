@@ -319,18 +319,20 @@ pub async fn load_content_webview(
     });
 
     // 创建新的 WebView builder（配置在任意线程完成）
+    // on_page_load 回调在 WebView2 导航回调链内触发（主线程），只做原子标记，
+    // 绝不调用 show()/emit() 等 Tauri API，避免在 WebView2 COM 回调链内
+    // 触发 Win32 消息导致主线程消息泵阻塞（SendMessageW 广播死锁）。
     let loaded_flag = loaded.clone();
     let mut webview_builder = tauri::webview::WebviewBuilder::new(
         "content-webview",
         tauri::WebviewUrl::External(webview_url),
     )
     .background_color(bg_color)
-    .on_page_load(move |webview, payload| {
+    .on_page_load(move |_webview, payload| {
         use tauri::webview::PageLoadEvent;
         if payload.event() == PageLoadEvent::Finished {
+            // 仅设置原子标记，不做任何 Tauri API 调用
             loaded_flag.store(true, Ordering::Relaxed);
-            let _ = webview.show();
-            let _ = window_handle.emit("webview:page-loaded", "");
         }
     });
 
@@ -338,34 +340,72 @@ pub async fn load_content_webview(
         webview_builder = webview_builder.initialization_script(&init_script);
     }
 
-    // 以下窗口操作必须在主线程执行
+    // 以下窗口操作拆分为独立的 run_on_main_thread 闭包，确保主线程消息泵
+    // 在各闭包之间有呼吸空间，避免 SendMessageW（DPI/Win+D 广播）被阻塞导致系统级死锁
+
+    // 1. 移除旧的 content-webview（独立闭包：遍历 + close）
+    let window_close = window.clone();
     run_on_main_thread(&app, move || {
-        // 1. 移除旧的 content-webview
-        let webviews = window.webviews();
+        let webviews = window_close.webviews();
         for w in &webviews {
             if w.label() == "content-webview" {
                 let _ = w.close();
             }
         }
+        Ok::<(), String>(())
+    }).await?;
 
-        // 2. 添加新的 WebView 子视图
+    // 2. 添加新的 WebView 子视图（独立闭包：add_child 涉及 WebView2 COM 初始化，较慢）
+    run_on_main_thread(&app, move || {
         window.add_child(
             webview_builder,
             tauri::LogicalPosition::new(x, y),
             tauri::LogicalSize::new(width, height),
         ).map_err(|e| format!("创建 WebView 失败: {}", e))?;
+        Ok::<(), String>(())
+    }).await?;
 
-        // 3. 立即隐藏 WebView，让 HTML loading overlay 可见
-        let all_webviews = window.webviews();
+    // 3. 立即隐藏 WebView，让 HTML loading overlay 可见（独立闭包：快速属性操作）
+    let window_hide = window_handle.clone();
+    run_on_main_thread(&app, move || {
+        let all_webviews = window_hide.webviews();
         for w in &all_webviews {
             if w.label() == "content-webview" {
                 let _ = w.hide();
                 break;
             }
         }
-
         Ok::<(), String>(())
     }).await?;
+
+    // 异步轮询 loaded_flag，页面加载完成后在主线程执行 show + emit
+    // 这样避免在 on_page_load（WebView2 COM 回调链）内直接调用 Tauri API
+    let poll_loaded = loaded.clone();
+    let poll_app = app.clone();
+    let poll_window = window_handle;
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if poll_loaded.load(Ordering::Relaxed) {
+                let app_for_emit = poll_app.clone();
+                let w = poll_window.clone();
+                let _ = run_on_main_thread(&poll_app, move || {
+                    let webviews = w.webviews();
+                    for webview in &webviews {
+                        if webview.label() == "content-webview" {
+                            let _ = webview.show();
+                            break;
+                        }
+                    }
+                    if let Some(main_win) = app_for_emit.get_webview_window("main") {
+                        let _ = main_win.emit("webview:page-loaded", "");
+                    }
+                    Ok::<(), String>(())
+                }).await;
+                break;
+            }
+        }
+    });
 
     Ok(())
 }
@@ -413,12 +453,8 @@ pub async fn get_or_create_model_webview(
         return Ok(false); // false = 已缓存
     }
 
-    // ② 慢路径：获取互斥锁
-    let _guard = WEBVIEW_CREATE_MUTEX.lock().await;
-
-    // 准备创建新 WebView 的异步安全操作
+    // ② 慢路径：先在锁外完成所有准备工作（URL 解析、WebView builder 构建、超时保护）
     let webview_url = url::Url::parse(&url).map_err(|e| format!("URL 解析失败: {}", e))?;
-    let window_handle = window.clone();
     let init_script = generate_theme_init_script(&theme);
     let bg_color = match theme.as_str() {
         "dark" => tauri::webview::Color(26, 26, 46, 255),
@@ -439,6 +475,7 @@ pub async fn get_or_create_model_webview(
     });
 
     // 创建 WebView builder（配置可在任意线程完成）
+    // on_page_load 回调只做原子标记，避免在 WebView2 COM 回调链内阻塞主线程消息泵
     let webview_label = label.clone();
     let loaded_flag = loaded.clone();
     let mut webview_builder = tauri::webview::WebviewBuilder::new(
@@ -446,12 +483,11 @@ pub async fn get_or_create_model_webview(
         tauri::WebviewUrl::External(webview_url),
     )
     .background_color(bg_color)
-    .on_page_load(move |webview, payload| {
+    .on_page_load(move |_webview, payload| {
         use tauri::webview::PageLoadEvent;
         if payload.event() == PageLoadEvent::Finished {
+            // 仅设置原子标记，不做任何 Tauri API 调用
             loaded_flag.store(true, Ordering::Relaxed);
-            let _ = webview.show();
-            let _ = window_handle.emit("webview:page-loaded", "");
         }
     });
 
@@ -459,72 +495,127 @@ pub async fn get_or_create_model_webview(
         webview_builder = webview_builder.initialization_script(&init_script);
     }
 
-    // ③ 双重检查 + 创建：在主线程执行所有窗口操作
-    let created = run_on_main_thread(&app, {
-        let label = label.clone();
-        let model_id = model_id.clone();
-        let webview_label = webview_label.clone();
-        let window = window.clone();
-        let webview_builder = webview_builder;
-        move || -> Result<bool, String> {
-            // ③-a 锁内再次确认 WebView 不存在
-            let webviews = window.webviews();
+    // ③ 获取互斥锁，仅在临界区内执行双重检查 + 创建，完成后立即释放
+    // 关键：每个 run_on_main_thread 闭包只做最小粒度操作，确保主线程消息泵
+    //       在各闭包之间有呼吸空间，避免 SendMessageW（DPI/Win+D 广播）被阻塞导致系统级死锁
+    let created = {
+        let _guard = WEBVIEW_CREATE_MUTEX.lock().await;
+
+        // ③-a 锁内再次确认 WebView 不存在（快速闭包：仅遍历+属性设置）
+        let window_check = window.clone();
+        let label_dup = label.clone();
+        let model_id_dup = model_id.clone();
+        let found_in_lock = run_on_main_thread(&app, move || {
+            let webviews = window_check.webviews();
             for w in &webviews {
-                if w.label() == label {
+                if w.label() == label_dup {
                     w.set_position(tauri::LogicalPosition::new(x, y))
                         .map_err(|e| format!("调整位置失败: {}", e))?;
                     w.set_size(tauri::LogicalSize::new(width, height))
                         .map_err(|e| format!("调整大小失败: {}", e))?;
                     let _ = w.show();
-                    lru_touch(&model_id);
-                    return Ok(false); // 已存在
+                    lru_touch(&model_id_dup);
+                    return Ok(true);
                 }
             }
+            Ok(false)
+        }).await?;
 
-            // ③-b 创建新 WebView
-            window.add_child(
-                webview_builder,
-                tauri::LogicalPosition::new(x, y),
-                tauri::LogicalSize::new(width, height),
-            ).map_err(|e| format!("创建 WebView 失败: {}", e))?;
-
-            // 立即隐藏 WebView
-            let all_webviews = window.webviews();
-            for w in &all_webviews {
-                if w.label() == webview_label {
-                    let _ = w.hide();
-                    break;
+        if found_in_lock {
+            false
+        } else {
+            // ③-b 创建新 WebView（独立闭包：add_child 涉及 WebView2 COM 初始化，较慢）
+            // 此闭包结束后，主线程消息泵恢复 → 系统广播可被处理
+            run_on_main_thread(&app, {
+                let w = window.clone();
+                move || {
+                    w.add_child(
+                        webview_builder,
+                        tauri::LogicalPosition::new(x, y),
+                        tauri::LogicalSize::new(width, height),
+                    ).map_err(|e| format!("创建 WebView 失败: {}", e))?;
+                    Ok::<(), String>(())
                 }
-            }
+            }).await?;
 
-            // LRU：插入新创建的模型
-            lru_touch(&model_id);
-
-            // LRU：淘汰超限的 WebView
-            while lru_len() > MAX_CACHED_WEBVIEWS {
-                if let Some(evict_id) = lru_pop_back() {
-                    let evict_label = format!("webview-{}", evict_id);
-                    let all_wv = window.webviews();
-                    for w in &all_wv {
-                        if w.label() == evict_label {
-                            let _ = w.close();
+            // ③-c 立即隐藏 WebView（独立闭包：快速属性操作）
+            run_on_main_thread(&app, {
+                let w = window.clone();
+                let lbl = webview_label.clone();
+                move || {
+                    let all = w.webviews();
+                    for webview in &all {
+                        if webview.label() == lbl {
+                            let _ = webview.hide();
                             break;
                         }
                     }
-                } else {
+                    Ok::<(), String>(())
+                }
+            }).await?;
+
+            // ③-d LRU 操作（独立闭包：遍历 + close）
+            run_on_main_thread(&app, {
+                let w = window.clone();
+                let mid = model_id.clone();
+                move || {
+                    lru_touch(&mid);
+                    while lru_len() > MAX_CACHED_WEBVIEWS {
+                        if let Some(evict_id) = lru_pop_back() {
+                            let evict_label = format!("webview-{}", evict_id);
+                            let all_wv = w.webviews();
+                            for webview in &all_wv {
+                                if webview.label() == evict_label {
+                                    let _ = webview.close();
+                                    break;
+                                }
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    Ok::<(), String>(())
+                }
+            }).await?;
+
+            true
+        }
+    }; // _guard 在此处释放，锁不再持有
+
+    // 如果是新创建的 WebView，异步轮询 loaded_flag，页面加载完成后在主线程执行 show + emit
+    // 避免在 on_page_load（WebView2 COM 回调链）内直接调用 Tauri API 阻塞消息泵
+    if created {
+        let poll_loaded = loaded.clone();
+        let poll_app = app.clone();
+        let poll_label = label.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if poll_loaded.load(Ordering::Relaxed) {
+                    let lbl = poll_label.clone();
+                    let app_for_emit = poll_app.clone();
+                    let _ = run_on_main_thread(&poll_app, move || {
+                        if let Some(main_win) = app_for_emit.get_window("main") {
+                            let webviews = main_win.webviews();
+                            for w in &webviews {
+                                if w.label() == lbl {
+                                    let _ = w.show();
+                                    break;
+                                }
+                            }
+                            if let Some(emit_win) = app_for_emit.get_webview_window("main") {
+                                let _ = emit_win.emit("webview:page-loaded", "");
+                            }
+                        }
+                        Ok::<(), String>(())
+                    }).await;
                     break;
                 }
             }
-
-            Ok(true) // 新创建
-        }
-    }).await?;
-
-    if created {
-        Ok(true)
-    } else {
-        Ok(false)
+        });
     }
+
+    Ok(created)
 }
 
 /// 切换到指定模型（隐藏其他所有模型 WebView，只显示目标模型）
