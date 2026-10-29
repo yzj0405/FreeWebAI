@@ -21,19 +21,89 @@ const webviewLoaded = ref(false)
 type SwitchState = 'idle' | 'loading' | 'error'
 const modelSwitchState = ref<SwitchState>('idle')
 const modelSwitchError = ref('')
+// 15s 后仅提示"网速较慢"，不显示红色错误（慢网首载常见，页面稍后加载完成会自动覆盖）
+const slowLoading = ref(false)
 let switchTimeoutTimer: ReturnType<typeof setTimeout> | null = null
-const SWITCH_TIMEOUT = 15000 // 15秒超时
+let slowTimer: ReturnType<typeof setTimeout> | null = null
+// 15s：慢速提示；32s：兜底超时（Rust 端 30s 会先发出 load-failed 事件）
+const SWITCH_SLOW_TIMEOUT = 15000
+const SWITCH_TIMEOUT = 32000
+
+// 最近一次请求加载的模型（首次加载失败时 activeModel 为空，"重试"按钮需要用到）
+const lastRequestedModel = ref<Model | null>(null)
+
+function clearSwitchTimers() {
+  if (switchTimeoutTimer) {
+    clearTimeout(switchTimeoutTimer)
+    switchTimeoutTimer = null
+  }
+  if (slowTimer) {
+    clearTimeout(slowTimer)
+    slowTimer = null
+  }
+  slowLoading.value = false
+}
+
+function armSwitchTimers(version: number) {
+  clearSwitchTimers()
+  slowTimer = setTimeout(() => {
+    if (loadVersion === version && modelSwitchState.value === 'loading') {
+      slowLoading.value = true
+    }
+  }, SWITCH_SLOW_TIMEOUT)
+  switchTimeoutTimer = setTimeout(() => {
+    if (loadVersion === version && modelSwitchState.value === 'loading') {
+      modelSwitchState.value = 'error'
+      modelSwitchError.value = '连接超时，请检查网络后重试'
+    }
+  }, SWITCH_TIMEOUT)
+}
+
+// 从事件 payload（"webview-{id}" 或裸 id）提取模型 ID
+function modelIdFromLabel(label: string): string {
+  return label.startsWith('webview-') ? label.slice('webview-'.length) : label
+}
+
+// 焦点恢复：把键盘焦点交还当前模型 WebView，实现切回窗口/切换模型后直接续打输入。
+// 必须延迟 200ms 调用：窗口激活消息（WM_ACTIVATE）处理阶段内调用 WebView2 焦点接口
+// 会与其激活流程互相等待导致主线程死锁（已实测复现），激活完成后再调用是安全的。
+// 页面会记住上次聚焦的输入框（document.activeElement），焦点一恢复即可继续输入。
+let focusRestoreTimer: ReturnType<typeof setTimeout> | null = null
+
+function scheduleFocusRestore() {
+  if (!activeModel.value) return
+  if (focusRestoreTimer) clearTimeout(focusRestoreTimer)
+  focusRestoreTimer = setTimeout(() => {
+    focusRestoreTimer = null
+    if (!activeModel.value) return
+    tauriAPI.restoreWebviewFocus().catch(() => {})
+  }, 200)
+}
 
 // WebView 页面加载事件监听器
 let unlistenPageLoaded: UnlistenFn | null = null
 let unlistenLoadFailed: UnlistenFn | null = null
+let unlistenFocus: (() => void) | null = null
 
 let sidebarTimer: ReturnType<typeof setTimeout> | null = null
 let resizeTimer: ReturnType<typeof setTimeout> | null = null
 let unlistenResize: (() => void) | null = null
 
-// 新增：已缓存的模型 ID 集合（用于判断是否需要显示 loading）
-const loadedModels = ref<Set<string>>(new Set())
+// 已缓存的模型 ID 集合（插入顺序 = 最近使用顺序，用于镜像 Rust 端 LRU 容量限制）
+const loadedModels = ref<Map<string, boolean>>(new Map())
+// 与 Rust 端 MAX_CACHED_WEBVIEWS 保持一致
+const MAX_CACHED_WEBVIEWS = 5
+
+// 标记模型为已加载（移到最新位置），超出容量时淘汰最旧记录，与 Rust 端 LRU 保持同步
+function markModelLoaded(modelId: string) {
+  loadedModels.value.delete(modelId)
+  loadedModels.value.set(modelId, true)
+  while (loadedModels.value.size > MAX_CACHED_WEBVIEWS) {
+    const oldest = loadedModels.value.keys().next().value
+    if (oldest === undefined) break
+    loadedModels.value.delete(oldest)
+  }
+}
 
 // P0-4: 操作版本号，用于取消过期的异步操作
 let loadVersion = 0
@@ -58,73 +128,66 @@ async function loadConfig() {
   }
 }
 
-// 核心改动：使用缓存机制处理模型点击
-async function handleModelClick(model: Model) {
-  if (activeModel.value?.id === model.id) return
+// 模型操作串行队列：同一时间只执行一个切换/刷新/重试流程。
+// 快速点击时若两个流程并发执行，迟到的 RPC 会交错覆盖（例如旧流程的
+// switchToModel 晚于新流程执行，导致显示的界面与点击不对应），
+// 串行化 + 版本号检查保证过期流程完全跳过、新流程在旧流程彻底结束后才开始
+let modelOpQueue: Promise<void> = Promise.resolve()
 
-  // 防抖：如果正在加载同一个模型，忽略
-  if (loadingModelId === model.id) return
-
-  // 如果正在加载其他模型，允许切换但记录状态
-  // loadingModelId 会在操作完成后清空
-
-  // P0-4: 递增版本号，使之前的异步操作失效
+function enqueueModelOp(model: Model, run: (model: Model, version: number) => Promise<void>) {
   const version = ++loadVersion
-  
-  // 标记正在加载
   loadingModelId = model.id
+  lastRequestedModel.value = model
 
-  // 保存旧的 activeModel id，用于后续隐藏其 WebView
-  const previousModelId = activeModel.value?.id
-
-  // 判断是否为首次加载该模型
-  const isFirstLoad = !loadedModels.value.has(model.id)
-
-  // 立即更新 UI 显示（但不立即设置 activeModel，以避免在加载失败时显示错误内容）
-  // 这里只更新 loading 状态
+  // 立即给出 loading 反馈（实际操作在队列中串行执行）
   modelSwitchState.value = 'loading'
   modelSwitchError.value = ''
-  
-  // 清除之前的超时定时器
-  if (switchTimeoutTimer) clearTimeout(switchTimeoutTimer)
-  
-  // 设置超时保护
-  switchTimeoutTimer = setTimeout(() => {
-    if (loadVersion === version && modelSwitchState.value === 'loading') {
-      modelSwitchState.value = 'error'
-      modelSwitchError.value = '连接超时，请检查网络后重试'
-    }
-  }, SWITCH_TIMEOUT)
+  armSwitchTimers(version)
 
-  if (isFirstLoad) {
-    // 首次加载：先隐藏旧模型的 WebView（让 loading overlay 可见）
-    if (previousModelId && loadedModels.value.has(previousModelId)) {
-      try {
-        await tauriAPI.switchToModel(model.id)
-      } catch {
-        // 忽略
+  const op = modelOpQueue.then(() => {
+    if (loadVersion !== version) return // 已被更新的操作取代
+    return run(model, version)
+  })
+  modelOpQueue = op.catch(() => {})
+  return op.finally(() => {
+    if (loadVersion === version && loadingModelId === model.id) loadingModelId = null
+  })
+}
+
+// 核心改动：使用缓存机制处理模型点击
+function handleModelClick(model: Model) {
+  if (activeModel.value?.id === model.id) return
+  // 防抖：如果正在加载同一个模型，忽略
+  if (loadingModelId === model.id) return
+  enqueueModelOp(model, doModelSwitch)
+}
+
+// 执行模型切换（在串行队列中调用）
+async function doModelSwitch(model: Model, version: number) {
+  try {
+    const isFirstLoad = !loadedModels.value.has(model.id)
+    const previousModelId = activeModel.value?.id
+
+    if (isFirstLoad) {
+      // 首次加载：先隐藏旧模型的 WebView（让 loading overlay 可见）
+      if (previousModelId && loadedModels.value.has(previousModelId)) {
+        try {
+          await tauriAPI.switchToModel(model.id)
+        } catch {
+          // 忽略
+        }
       }
-    }
-    // P0-4: 检查版本号是否仍然有效
-    if (loadVersion !== version) {
-      loadingModelId = null // 清除锁
-      return
-    }
-    // 创建新 WebView 并显示 loading
-    await loadModelWithCache(model, version)
-    // 加载完成后清除锁
-    if (loadVersion === version) loadingModelId = null
-  } else {
-    // 已缓存：先调整大小，再显示（无 loading 动画，瞬间完成）
-    try {
+      // P0-4: 检查版本号是否仍然有效
+      if (loadVersion !== version) return
+      // 创建新 WebView 并显示 loading
+      await loadModelWithCache(model, version)
+    } else {
+      // 已缓存：先调整大小，再显示（无 loading 动画，瞬间完成）
       // 先获取容器当前位置，确保 WebView 大小正确
       await new Promise(resolve => setTimeout(resolve, 10))
 
       // P0-4: 检查版本号
-      if (loadVersion !== version) {
-        loadingModelId = null
-        return
-      }
+      if (loadVersion !== version) return
 
       const container = document.getElementById('webview-container')
       if (container) {
@@ -139,29 +202,35 @@ async function handleModelClick(model: Model) {
       }
 
       // P0-4: 再次检查版本号
-      if (loadVersion !== version) {
-        loadingModelId = null
+      if (loadVersion !== version) return
+
+      // 切换到目标模型（显示目标，隐藏其他）
+      // 返回 false 表示 WebView 已被 Rust 端 LRU 淘汰，回退到重建流程，
+      // 否则点击会静默无操作（表现为"点了没反应"）
+      const exists = await tauriAPI.switchToModel(model.id)
+      if (loadVersion !== version) return
+      if (!exists) {
+        loadedModels.value.delete(model.id)
+        await loadModelWithCache(model, version)
         return
       }
 
-      // 切换到目标模型（显示目标，隐藏其他）
-      await tauriAPI.switchToModel(model.id)
-      
       // 只有版本号仍然匹配时才更新状态
       if (loadVersion === version) {
+        markModelLoaded(model.id)
         activeModel.value = model
         webviewLoaded.value = true
         modelSwitchState.value = 'idle'
-        if (switchTimeoutTimer) clearTimeout(switchTimeoutTimer)
+        clearSwitchTimers()
+        // 切换完成后恢复焦点：页面记住了上次的输入框位置，可直接续打
+        scheduleFocusRestore()
       }
-    } catch (error) {
-      console.error('切换模型失败:', error)
-      if (loadVersion === version) {
-        modelSwitchState.value = 'error'
-        modelSwitchError.value = '切换模型失败: ' + (error as Error).message
-      }
-    } finally {
-      if (loadVersion === version) loadingModelId = null
+    }
+  } catch (error) {
+    console.error('切换模型失败:', error)
+    if (loadVersion === version) {
+      modelSwitchState.value = 'error'
+      modelSwitchError.value = '切换模型失败: ' + (error as Error).message
     }
   }
 }
@@ -172,7 +241,7 @@ async function loadModelWithCache(model: Model, version?: number) {
   const myVersion = version ?? loadVersion
 
   // 清除之前的超时定时器
-  if (switchTimeoutTimer) clearTimeout(switchTimeoutTimer)
+  clearSwitchTimers()
 
   modelSwitchState.value = 'loading'
   modelSwitchError.value = ''
@@ -186,14 +255,8 @@ async function loadModelWithCache(model: Model, version?: number) {
   // P0-4: 检查版本号
   if (loadVersion !== myVersion) return
 
-  // P1-4: 超时兜底 — 保存当前版本号到定时器闭包，避免孤儿定时器误触发
-  switchTimeoutTimer = setTimeout(() => {
-    // 只有当版本号仍然匹配且仍在 loading 状态时才触发超时
-    if (loadVersion === myVersion && modelSwitchState.value === 'loading') {
-      modelSwitchState.value = 'error'
-      modelSwitchError.value = '连接超时，请检查网络后重试'
-    }
-  }, SWITCH_TIMEOUT)
+  // 超时兜底（15s 慢速提示，32s 兜底超时；Rust 端 30s 会先发出 load-failed 事件）
+  armSwitchTimers(myVersion)
 
   try {
     // 等待 DOM 更新后获取容器位置
@@ -204,7 +267,7 @@ async function loadModelWithCache(model: Model, version?: number) {
 
     const container = document.getElementById('webview-container')
     if (!container) {
-      if (switchTimeoutTimer) clearTimeout(switchTimeoutTimer)
+      clearSwitchTimers()
       modelSwitchState.value = 'error'
       modelSwitchError.value = '容器未找到'
       return
@@ -227,13 +290,15 @@ async function loadModelWithCache(model: Model, version?: number) {
     if (loadVersion !== myVersion) return
 
     if (isNewCreated) {
-      // 新创建的 WebView：标记为已加载，保持 loading 状态
-      loadedModels.value.add(model.id)
+      // 新创建的 WebView：标记为已加载，保持 loading 状态（等待 page-loaded 事件后进入 idle）
+      markModelLoaded(model.id)
       webviewLoaded.value = true
     } else {
-      // 已缓存的 WebView
+      // 已缓存的 WebView（Rust 快速路径已直接 show）
+      markModelLoaded(model.id)
       webviewLoaded.value = true
       modelSwitchState.value = 'idle'
+      clearSwitchTimers()
     }
     
     // 加载成功后更新 activeModel
@@ -241,7 +306,7 @@ async function loadModelWithCache(model: Model, version?: number) {
       activeModel.value = model
     }
   } catch (error) {
-    if (switchTimeoutTimer) clearTimeout(switchTimeoutTimer)
+    clearSwitchTimers()
     if (loadVersion !== myVersion) return // P0-4: 过期操作不再处理
     console.error('加载 WebView 失败:', error)
     modelSwitchState.value = 'error'
@@ -254,26 +319,29 @@ async function loadModelWithCache(model: Model, version?: number) {
 // async function loadModelInWebview(url: string) { ... }
 
 function retryLoadModel() {
-  if (activeModel.value) {
-    // 使用新的缓存 API 重试
-    loadModelWithCache(activeModel.value)
-  }
+  // 首次加载失败时 activeModel 为空，回退到最近请求的模型
+  const model = activeModel.value ?? lastRequestedModel.value
+  if (!model) return
+  enqueueModelOp(model, (m, v) => loadModelWithCache(m, v))
 }
 
-async function refreshCurrentModel() {
-  if (activeModel.value) {
-    // 刷新当前模型：先销毁旧 WebView，再重新创建
-    const modelId = activeModel.value.id
-    loadedModels.value.delete(modelId)
-    // 先销毁旧的 WebView（确保 get_or_create_model_webview 走新建分支）
+// 刷新当前模型：销毁旧 WebView 后重新创建（走队列，避免与切换流程交错）
+function refreshCurrentModel() {
+  const model = activeModel.value
+  if (!model) return
+  enqueueModelOp(model, async (m, version) => {
+    // 先销毁旧 WebView（确保 get_or_create_model_webview 走新建分支）
+    loadedModels.value.delete(m.id)
     try {
-      await tauriAPI.hideModelWebview(modelId)
+      await tauriAPI.hideModelWebview(m.id)
     } catch {
       // 忽略销毁失败（WebView 可能已不存在）
     }
+    // P0-4: 过期操作不再继续
+    if (loadVersion !== version) return
     // 重新创建（会触发 loading 动画 + 页面重新加载）
-    await loadModelWithCache(activeModel.value)
-  }
+    await loadModelWithCache(m, version)
+  })
 }
 
 // 仅调整当前活动模型 WebView 的位置/大小（不重建，无白屏闪烁）
@@ -317,15 +385,35 @@ async function toggleMaximize() {
 // 侧边栏视觉折叠状态（延迟切换，与 CSS 动画同步）
 const sidebarVisualCollapsed = ref(config.value?.sidebarCollapsed ?? false)
 
+// 侧边栏动画期间的 WebView 分步同步定时器
+let resizeAnimTimer: ReturnType<typeof setInterval> | null = null
+
+// 在 duration 毫秒内以约 30fps 分步调整 WebView 位置/大小，结束时精确对齐。
+// 原生 WebView 层不参与 CSS 过渡，若只在动画结束后调整一次，
+// 动画过程中会出现 WebView 与侧边栏重叠/留缝、画面跳动（不优雅的根源）
+function animateWebviewResize(duration: number) {
+  if (!activeModel.value) return
+  if (resizeAnimTimer) clearInterval(resizeAnimTimer)
+  const start = performance.now()
+  resizeAnimTimer = setInterval(() => {
+    resizeWebviewOnly()
+    if (performance.now() - start >= duration) {
+      if (resizeAnimTimer) clearInterval(resizeAnimTimer)
+      resizeAnimTimer = null
+      resizeWebviewOnly() // 最终精确对齐
+    }
+  }, 33)
+}
+
 async function toggleSidebar() {
   if (!config.value) return
   const newCollapsed = !config.value.sidebarCollapsed
   config.value.sidebarCollapsed = newCollapsed
   await tauriAPI.toggleSidebar(newCollapsed)
-  
+
   // 清除之前的定时器
   if (sidebarTimer) clearTimeout(sidebarTimer)
-  
+
   if (newCollapsed) {
     // 收起：内容立即切换为缩写
     sidebarVisualCollapsed.value = true
@@ -335,14 +423,11 @@ async function toggleSidebar() {
       sidebarVisualCollapsed.value = false
     }, 300)
   }
-  
-  // 侧边栏动画完成后，重新调整 WebView 位置
+
+  // 动画期间分步同步 WebView 位置，让原生层与侧边栏宽度过渡保持一致
+  // 收起：300ms 动画 + 余量；展开：300ms 延迟切换文字 + 300ms 动画 + 余量
   if (activeModel.value) {
-    // 收起：0ms 延迟 + 300ms 动画 + 50ms 余量 = 350ms
-    // 展开：300ms 延迟 + 300ms 动画 + 50ms 余量 = 650ms
-    const delay = newCollapsed ? 350 : 650
-    await new Promise(resolve => setTimeout(resolve, delay))
-    resizeWebviewOnly()
+    animateWebviewResize(newCollapsed ? 380 : 680)
   }
 }
 
@@ -371,7 +456,7 @@ async function closeSettings() {
   const newModelIds = new Set(config.value.models.map(m => m.id))
 
   // 检测被删除的模型，清理对应的缓存 WebView
-  for (const cachedId of loadedModels.value) {
+  for (const cachedId of Array.from(loadedModels.value.keys())) {
     if (!newModelIds.has(cachedId)) {
       // 模型已被删除，清理 WebView
       try {
@@ -413,9 +498,17 @@ async function closeSettings() {
         )
       }
       
-      // 显示该模型的 WebView
-      await tauriAPI.switchToModel(activeModel.value.id)
+      // 显示该模型的 WebView（返回 false 表示已被 LRU 淘汰，回退到重建流程）
+      const restored = await tauriAPI.switchToModel(activeModel.value.id)
+      if (!restored) {
+        loadedModels.value.delete(activeModel.value.id)
+        await loadModelWithCache(activeModel.value)
+        return
+      }
+      markModelLoaded(activeModel.value.id)
       webviewLoaded.value = true
+      // 设置关闭后恢复焦点，可直接续打
+      scheduleFocusRestore()
     } catch (error) {
       console.error('恢复模型失败:', error)
       // 如果恢复失败（WebView 可能已被意外销毁），尝试重新加载
@@ -431,16 +524,25 @@ async function closeSettings() {
 onMounted(async () => {
   await loadConfig()
   
-  // 监听 WebView 页面真实加载完成事件（Rust on_page_load 回调）
-  unlistenPageLoaded = await listen('webview:page-loaded', () => {
-    if (switchTimeoutTimer) clearTimeout(switchTimeoutTimer)
+  // 监听 WebView 页面真实加载完成事件（Rust on_page_load 回调，payload 携带 "webview-{id}" 标识）
+  // 只处理当前正在加载/当前激活模型的事件，过滤被放弃的旧加载任务发出的过期事件，
+  // 避免过期事件把界面误置为错误态（红色错误图标闪现的根源之一）
+  unlistenPageLoaded = await listen<string>('webview:page-loaded', (event) => {
+    const modelId = modelIdFromLabel(event.payload || '')
+    if (modelId !== loadingModelId && modelId !== activeModel.value?.id) return
+    clearSwitchTimers()
     modelSwitchState.value = 'idle'
+    // 页面加载完成，恢复焦点，可直接输入
+    scheduleFocusRestore()
   })
 
-  // 监听 WebView 页面加载失败事件（Rust 超时保护触发）
+  // 监听 WebView 页面加载失败事件（Rust 超时保护触发，payload 为 "webview-{id}"）
+  // 仅在 loading 阶段且匹配当前在加载的模型时生效
   unlistenLoadFailed = await listen<string>('webview:load-failed', (event) => {
     console.error('WebView 加载超时:', event.payload)
-    if (switchTimeoutTimer) clearTimeout(switchTimeoutTimer)
+    const modelId = modelIdFromLabel(event.payload || '')
+    if (modelId !== loadingModelId || modelSwitchState.value !== 'loading') return
+    clearSwitchTimers()
     modelSwitchState.value = 'error'
     modelSwitchError.value = '页面加载超时，请检查网络后重试'
   })
@@ -450,6 +552,12 @@ onMounted(async () => {
   const currentWindow = getCurrentWindow()
   unlistenResize = await currentWindow.onResized(() => {
     scheduleWebviewResize()
+  })
+
+  // 监听窗口焦点变化：从其他软件切回时，延迟恢复模型 WebView 的键盘焦点，
+  // 实现切回后直接续打输入（延迟调用避开窗口激活消息处理阶段，防止死锁）
+  unlistenFocus = await currentWindow.onFocusChanged(({ payload: focused }) => {
+    if (focused) scheduleFocusRestore()
   })
 })
 
@@ -481,8 +589,11 @@ async function handleSyncCloud(serverUrl: string) {
 onBeforeUnmount(() => {
   if (sidebarTimer) clearTimeout(sidebarTimer)
   if (resizeTimer) clearTimeout(resizeTimer)
-  if (switchTimeoutTimer) clearTimeout(switchTimeoutTimer)
+  if (resizeAnimTimer) clearInterval(resizeAnimTimer)
+  if (focusRestoreTimer) clearTimeout(focusRestoreTimer)
+  clearSwitchTimers()
   if (unlistenResize) unlistenResize()
+  if (unlistenFocus) unlistenFocus()
   if (unlistenPageLoaded) unlistenPageLoaded()
   if (unlistenLoadFailed) unlistenLoadFailed()
 })
@@ -530,7 +641,6 @@ onBeforeUnmount(() => {
             <span v-if="sidebarVisualCollapsed" class="model-abbr">{{ model.name.charAt(0) }}</span>
             <div v-else class="model-info">
               <span class="model-name">{{ model.name }}</span>
-              <span class="model-version">{{ model.version }}</span>
             </div>
           </div>
           
@@ -560,7 +670,7 @@ onBeforeUnmount(() => {
         <div v-if="modelSwitchState === 'loading'" class="switch-overlay">
           <div class="switch-loading">
             <el-icon class="is-loading" :size="48"><Loading /></el-icon>
-            <p class="switch-text">正在加载 {{ activeModel?.name }}...</p>
+            <p class="switch-text">{{ slowLoading ? `网速较慢，仍在加载 ${activeModel?.name ?? ''} …` : `正在加载 ${activeModel?.name ?? ''}...` }}</p>
           </div>
         </div>
         
@@ -697,6 +807,7 @@ onBeforeUnmount(() => {
   border-radius: 6px;
   cursor: pointer;
   transition: background-color 0.2s;
+  overflow: hidden;
 }
 
 .model-item:hover {
@@ -711,18 +822,18 @@ onBeforeUnmount(() => {
 .model-info {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  justify-content: center;
+  min-width: 0;
 }
 
 .model-name {
   font-size: 14px;
   font-weight: 500;
   color: var(--text-color);
-}
-
-.model-version {
-  font-size: 12px;
-  color: #999;
+  /* 宽度动画期间禁止换行，避免文字错位；超宽时省略号截断 */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .model-abbr {

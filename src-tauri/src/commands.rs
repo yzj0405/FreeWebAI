@@ -3,9 +3,9 @@ use crate::config::{self, AppConfig, Model};
 use crate::ReqwestClient;
 use serde::{Serialize, Deserialize};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex as StdMutex;
 use tokio::sync::{Mutex as TokioMutex, oneshot};
 
@@ -20,6 +20,10 @@ const MAX_CACHED_WEBVIEWS: usize = 5;
 static LRU_CACHE: StdMutex<VecDeque<String>> = StdMutex::new(VecDeque::new());
 /// WebView 创建互斥锁，防止并发创建导致标签冲突
 static WEBVIEW_CREATE_MUTEX: TokioMutex<()> = TokioMutex::const_new(());
+/// 当前目标模型：最近一次用户激活的模型 ID。
+/// 用于让后台加载任务（超时通知、加载完成后的 show）判断自己是否已过期，
+/// 避免过期任务把旧 WebView 盖到当前界面上、或误报加载失败。
+static CURRENT_MODEL: StdMutex<Option<String>> = StdMutex::new(None);
 
 // ==================== LRU 缓存辅助函数 ====================
 
@@ -55,8 +59,61 @@ fn lru_clear() {
     }
 }
 
+/// 设置当前目标模型
+fn set_current_model(model_id: Option<String>) {
+    if let Ok(mut cur) = CURRENT_MODEL.lock() {
+        *cur = model_id;
+    }
+}
+
+/// 判断指定模型是否仍是当前目标
+fn is_current_model(model_id: &str) -> bool {
+    CURRENT_MODEL
+        .lock()
+        .ok()
+        .map(|c| c.as_deref() == Some(model_id))
+        .unwrap_or(false)
+}
+
+/// 页面加载成功过的 WebView 标签集合（"webview-{id}"）
+/// 用于区分"已缓存且可用"与"上次加载失败留下的空壳"，
+/// 后者在复用/切换时必须销毁重建，否则会显示空白页面
+static LOADED_PAGES: LazyLock<StdMutex<HashSet<String>>> =
+    LazyLock::new(|| StdMutex::new(HashSet::new()));
+
+/// 标记 WebView 页面已成功加载
+fn mark_page_loaded(label: &str) {
+    if let Ok(mut set) = LOADED_PAGES.lock() {
+        set.insert(label.to_string());
+    }
+}
+
+/// 取消页面加载标记（WebView 被销毁时调用）
+fn unmark_page_loaded(label: &str) {
+    if let Ok(mut set) = LOADED_PAGES.lock() {
+        set.remove(label);
+    }
+}
+
+/// 查询 WebView 页面是否已成功加载
+fn page_is_loaded(label: &str) -> bool {
+    LOADED_PAGES
+        .lock()
+        .ok()
+        .map(|set| set.contains(label))
+        .unwrap_or(false)
+}
+
+/// 清空所有页面加载标记
+fn clear_loaded_pages() {
+    if let Ok(mut set) = LOADED_PAGES.lock() {
+        set.clear();
+    }
+}
+
 /// 在主线程上执行闭包并返回结果（通过 oneshot 通道同步）
 /// Tauri 2.x 中，窗口/WebView 状态变更 API 必须在主线程执行
+/// 带 15s 超时保护：主线程一旦卡死，命令快速失败而不是永久挂起
 async fn run_on_main_thread<F, T>(app: &AppHandle, f: F) -> Result<T, String>
 where
     F: FnOnce() -> Result<T, String> + Send + 'static,
@@ -67,7 +124,10 @@ where
         let result = f();
         let _ = tx.send(result);
     }).map_err(|e| format!("调度主线程任务失败: {}", e))?;
-    rx.await.map_err(|_| "主线程通道已关闭".to_string())?
+    tokio::time::timeout(Duration::from_secs(15), rx)
+        .await
+        .map_err(|_| "主线程任务执行超时".to_string())?
+        .map_err(|_| "主线程通道已关闭".to_string())?
 }
 
 /// 获取配置
@@ -104,14 +164,12 @@ pub async fn sync_from_cloud(app: AppHandle, server_url: String) -> Result<AppCo
 }
 
 /// 检查模型 URL 是否可访问
+/// 复用全局共享客户端（避免每次调用都新建连接池），仅对单次请求设置 5s 超时
 #[tauri::command]
-pub async fn check_model_url(url: String) -> Result<bool, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .map_err(|e| e.to_string())?;
+pub async fn check_model_url(app: AppHandle, url: String) -> Result<bool, String> {
+    let client = app.state::<ReqwestClient>().0.clone();
 
-    match client.head(&url).send().await {
+    match client.head(&url).timeout(Duration::from_secs(5)).send().await {
         Ok(response) => {
             let status = response.status();
             Ok(status.is_success() || status.is_redirection())
@@ -384,6 +442,9 @@ pub async fn load_content_webview(
     let poll_app = app.clone();
     let poll_window = window_handle;
     tokio::spawn(async move {
+        // 硬性截止时间：防止页面永不触发 Finished 时任务无限轮询泄漏
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_secs(PAGE_LOAD_TIMEOUT_SECS * 2);
         loop {
             tokio::time::sleep(Duration::from_millis(50)).await;
             if poll_loaded.load(Ordering::Relaxed) {
@@ -398,10 +459,14 @@ pub async fn load_content_webview(
                         }
                     }
                     if let Some(main_win) = app_for_emit.get_webview_window("main") {
-                        let _ = main_win.emit("webview:page-loaded", "");
+                        // 携带标识，前端据此过滤过期事件
+                        let _ = main_win.emit("webview:page-loaded", "content-webview");
                     }
                     Ok::<(), String>(())
                 }).await;
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
                 break;
             }
         }
@@ -427,29 +492,40 @@ pub async fn get_or_create_model_webview(
     let window = app.get_window("main").ok_or("主窗口未找到")?;
     let label = format!("webview-{}", model_id);
 
+    // 记录当前目标模型（后台加载任务据此判断自己是否过期）
+    set_current_model(Some(model_id.clone()));
+
     // ① 快速路径：在主线程检查 WebView 是否已存在
+    // 仅当其页面成功加载过才复用；从未加载成功的残留 WebView（上次加载失败留下的
+    // 空壳）直接销毁、走下方重建流程，避免重试时显示空白页面
     let window_for_check = window.clone();
-    let found = run_on_main_thread(&app, {
+    let cached = run_on_main_thread(&app, {
         let label = label.clone();
         let model_id = model_id.clone();
         move || -> Result<bool, String> {
             let webviews = window_for_check.webviews();
             for w in &webviews {
                 if w.label() == label {
-                    w.set_position(tauri::LogicalPosition::new(x, y))
-                        .map_err(|e| format!("调整位置失败: {}", e))?;
-                    w.set_size(tauri::LogicalSize::new(width, height))
-                        .map_err(|e| format!("调整大小失败: {}", e))?;
-                    let _ = w.show();
-                    lru_touch(&model_id);
-                    return Ok(true);
+                    if page_is_loaded(&label) {
+                        w.set_position(tauri::LogicalPosition::new(x, y))
+                            .map_err(|e| format!("调整位置失败: {}", e))?;
+                        w.set_size(tauri::LogicalSize::new(width, height))
+                            .map_err(|e| format!("调整大小失败: {}", e))?;
+                        let _ = w.show();
+                        lru_touch(&model_id);
+                        return Ok(true);
+                    } else {
+                        let _ = w.close();
+                        unmark_page_loaded(&label);
+                        return Ok(false);
+                    }
                 }
             }
             Ok(false)
         }
     }).await?;
 
-    if found {
+    if cached {
         return Ok(false); // false = 已缓存
     }
 
@@ -469,13 +545,15 @@ pub async fn get_or_create_model_webview(
     let timeout_model_id = model_id.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(PAGE_LOAD_TIMEOUT_SECS)).await;
-        if !loaded_clone.load(Ordering::Relaxed) {
+        // 仅当该模型仍是当前目标时才报告失败，避免被放弃的加载
+        // （用户已切走/WebView 已被淘汰）在 30s 后误报过期失败事件
+        if !loaded_clone.load(Ordering::Relaxed) && is_current_model(&timeout_model_id) {
             let _ = window_timeout.emit("webview:load-failed", &timeout_model_id);
         }
     });
 
     // 创建 WebView builder（配置可在任意线程完成）
-    // on_page_load 回调只做原子标记，避免在 WebView2 COM 回调链内阻塞主线程消息泵
+    // on_page_load 回调只做原子标记 + 加载登记，避免在 WebView2 COM 回调链内阻塞主线程消息泵
     let webview_label = label.clone();
     let loaded_flag = loaded.clone();
     let mut webview_builder = tauri::webview::WebviewBuilder::new(
@@ -483,11 +561,12 @@ pub async fn get_or_create_model_webview(
         tauri::WebviewUrl::External(webview_url),
     )
     .background_color(bg_color)
-    .on_page_load(move |_webview, payload| {
+    .on_page_load(move |webview, payload| {
         use tauri::webview::PageLoadEvent;
         if payload.event() == PageLoadEvent::Finished {
-            // 仅设置原子标记，不做任何 Tauri API 调用
+            // 仅设置原子标记 + 登记加载成功，不做任何其他 Tauri API 调用
             loaded_flag.store(true, Ordering::Relaxed);
+            mark_page_loaded(webview.label());
         }
     });
 
@@ -502,6 +581,7 @@ pub async fn get_or_create_model_webview(
         let _guard = WEBVIEW_CREATE_MUTEX.lock().await;
 
         // ③-a 锁内再次确认 WebView 不存在（快速闭包：仅遍历+属性设置）
+        // 已存在但从未加载成功的残留同样销毁，走重建流程
         let window_check = window.clone();
         let label_dup = label.clone();
         let model_id_dup = model_id.clone();
@@ -509,13 +589,19 @@ pub async fn get_or_create_model_webview(
             let webviews = window_check.webviews();
             for w in &webviews {
                 if w.label() == label_dup {
-                    w.set_position(tauri::LogicalPosition::new(x, y))
-                        .map_err(|e| format!("调整位置失败: {}", e))?;
-                    w.set_size(tauri::LogicalSize::new(width, height))
-                        .map_err(|e| format!("调整大小失败: {}", e))?;
-                    let _ = w.show();
-                    lru_touch(&model_id_dup);
-                    return Ok(true);
+                    if page_is_loaded(&label_dup) {
+                        w.set_position(tauri::LogicalPosition::new(x, y))
+                            .map_err(|e| format!("调整位置失败: {}", e))?;
+                        w.set_size(tauri::LogicalSize::new(width, height))
+                            .map_err(|e| format!("调整大小失败: {}", e))?;
+                        let _ = w.show();
+                        lru_touch(&model_id_dup);
+                        return Ok(true);
+                    } else {
+                        let _ = w.close();
+                        unmark_page_loaded(&label_dup);
+                        return Ok(false);
+                    }
                 }
             }
             Ok(false)
@@ -567,6 +653,7 @@ pub async fn get_or_create_model_webview(
                             for webview in &all_wv {
                                 if webview.label() == evict_label {
                                     let _ = webview.close();
+                                    unmark_page_loaded(&evict_label);
                                     break;
                                 }
                             }
@@ -584,13 +671,23 @@ pub async fn get_or_create_model_webview(
 
     // 如果是新创建的 WebView，异步轮询 loaded_flag，页面加载完成后在主线程执行 show + emit
     // 避免在 on_page_load（WebView2 COM 回调链）内直接调用 Tauri API 阻塞消息泵
+    // 轮询任务带过期检查与硬性截止时间：用户已切走时立即退出，
+    // 防止任务无限泄漏、防止过期 WebView 稍后盖住当前界面
     if created {
+        set_current_model(Some(model_id.clone()));
         let poll_loaded = loaded.clone();
         let poll_app = app.clone();
         let poll_label = label.clone();
+        let poll_model_id = model_id.clone();
         tokio::spawn(async move {
+            let deadline =
+                tokio::time::Instant::now() + Duration::from_secs(PAGE_LOAD_TIMEOUT_SECS * 2);
             loop {
                 tokio::time::sleep(Duration::from_millis(50)).await;
+                // 该模型已不是当前目标（用户切走/打开设置）：放弃显示，任务退出
+                if !is_current_model(&poll_model_id) {
+                    break;
+                }
                 if poll_loaded.load(Ordering::Relaxed) {
                     let lbl = poll_label.clone();
                     let app_for_emit = poll_app.clone();
@@ -604,11 +701,15 @@ pub async fn get_or_create_model_webview(
                                 }
                             }
                             if let Some(emit_win) = app_for_emit.get_webview_window("main") {
-                                let _ = emit_win.emit("webview:page-loaded", "");
+                                // 携带模型标识，前端据此过滤过期事件
+                                let _ = emit_win.emit("webview:page-loaded", &lbl);
                             }
                         }
                         Ok::<(), String>(())
                     }).await;
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
                     break;
                 }
             }
@@ -618,36 +719,80 @@ pub async fn get_or_create_model_webview(
     Ok(created)
 }
 
+/// 获取当前目标模型 ID（None 表示无激活模型，如设置弹窗打开时）
+fn current_model_id() -> Option<String> {
+    CURRENT_MODEL.lock().ok().and_then(|c| c.clone())
+}
+
+/// 恢复当前模型 WebView 的键盘焦点（切回窗口/切换模型后自动续打输入）
+///
+/// 安全性约束：必须由前端在窗口激活、切换动画等动作**完成之后延迟调用**
+/// （前端统一延迟 200ms）。绝不能在 Focused 窗口事件回调内同步调用——
+/// 那会在 WM_ACTIVATE 处理中途触发 WebView2 跨进程 IPC，与 WebView2 的
+/// 激活流程互相等待，直接卡死主线程（已实测复现）。
+#[tauri::command]
+pub async fn restore_webview_focus(app: AppHandle) -> Result<(), String> {
+    let window = app.get_window("main").ok_or("主窗口未找到")?;
+
+    // 延迟期间用户可能又切走了：此时跳过，避免打扰用户当前的操作目标
+    if !window.is_focused().unwrap_or(false) {
+        return Ok(());
+    }
+
+    let target = match current_model_id() {
+        Some(id) => format!("webview-{}", id),
+        None => return Ok(()),
+    };
+
+    run_on_main_thread(&app, move || {
+        let webviews = window.webviews();
+        for w in &webviews {
+            if w.label() == target {
+                let _ = w.set_focus();
+                break;
+            }
+        }
+        Ok::<(), String>(())
+    }).await
+}
 /// 切换到指定模型（隐藏其他所有模型 WebView，只显示目标模型）
+/// 返回值：目标 WebView 是否存在并被显示（false 表示已被 LRU 淘汰，前端需回退到重建流程）
+/// 注意：不调用 webview.set_focus() —— WebView2 的焦点调用是与浏览器进程的
+/// 同步跨进程 IPC，页面繁忙时会卡住 UI 线程（偶发卡死的根源之一）；
+/// 用户点击页面时 WebView2 会自行获得键盘焦点。
 #[tauri::command]
 pub async fn switch_to_model(
     app: AppHandle,
     model_id: String,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let window = app.get_window("main").ok_or("主窗口未找到")?;
-    
+
     let target_label = format!("webview-{}", model_id);
+
+    // 更新当前目标模型（后台加载任务据此判断自己是否过期）
+    set_current_model(Some(model_id.clone()));
 
     // 更新 LRU 位置
     lru_touch(&model_id);
 
-    // 窗口状态变更必须在主线程执行
+    // 窗口状态变更必须在主线程执行。
+    // 目标页面从未加载成功时不显示（返回 false，前端回退到重建流程），
+    // 避免把空白/错误残留页展示出来
     run_on_main_thread(&app, move || {
+        let mut shown = false;
         let webviews = window.webviews();
         for w in &webviews {
             if w.label().starts_with("webview-") {
-                if w.label() == target_label {
+                if w.label() == target_label && page_is_loaded(&target_label) {
                     let _ = w.show();
-                    let _ = w.set_focus();
+                    shown = true;
                 } else {
                     let _ = w.hide();
                 }
             }
         }
-        Ok::<(), String>(())
-    }).await?;
-    
-    Ok(())
+        Ok(shown)
+    }).await
 }
 
 /// 调整指定模型 WebView 的位置和大小（不重建）
@@ -692,6 +837,7 @@ pub async fn hide_model_webview(
         for w in &webviews {
             if w.label() == label {
                 let _ = w.close();
+                unmark_page_loaded(&label);
                 break;
             }
         }
@@ -705,6 +851,9 @@ pub async fn hide_model_webview(
 #[tauri::command]
 pub async fn hide_all_model_webviews(app: AppHandle) -> Result<(), String> {
     let window = app.get_window("main").ok_or("主窗口未找到")?;
+
+    // 清空当前目标：加载中的后台任务不再执行 show，避免盖住设置弹窗
+    set_current_model(None);
 
     run_on_main_thread(&app, move || {
         let webviews = window.webviews();
@@ -724,6 +873,9 @@ pub async fn hide_all_model_webviews(app: AppHandle) -> Result<(), String> {
 pub async fn clear_all_model_webviews(app: AppHandle) -> Result<(), String> {
     let window = app.get_window("main").ok_or("主窗口未找到")?;
 
+    // 清空当前目标：后台加载任务不再执行 show
+    set_current_model(None);
+
     run_on_main_thread(&app, move || {
         let webviews = window.webviews();
         for w in &webviews {
@@ -734,8 +886,9 @@ pub async fn clear_all_model_webviews(app: AppHandle) -> Result<(), String> {
         Ok::<(), String>(())
     }).await?;
 
-    // 清空 LRU 队列
+    // 清空 LRU 队列和页面加载标记
     lru_clear();
+    clear_loaded_pages();
 
     Ok(())
 }
@@ -758,8 +911,13 @@ pub async fn remove_model_webview(app: AppHandle, model_id: String) -> Result<()
         Ok::<(), String>(())
     }).await?;
 
-    // 从 LRU 移除
+    // 若被移除的正是当前目标，清空标记
+    if is_current_model(&model_id) {
+        set_current_model(None);
+    }
+    // 从 LRU 和页面加载登记中移除（label 已被上方闭包 move，这里重建）
     lru_remove(&model_id);
+    unmark_page_loaded(&format!("webview-{}", model_id));
 
     Ok(())
 }

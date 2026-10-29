@@ -59,8 +59,13 @@ export const tauriAPI = {
   }),
 
   // 切换到指定模型（隐藏其他 WebView，只显示目标模型）
+  // 返回 true 表示目标 WebView 存在并已显示；false 表示已被 LRU 淘汰，需要重新加载
   switchToModel: (modelId: string) =>
-    invoke('switch_to_model', { modelId }),
+    invoke<boolean>('switch_to_model', { modelId }),
+
+  // 恢复当前模型 WebView 的键盘焦点（切回窗口/切换模型后自动续打输入）
+  // 必须延迟调用（前端统一 200ms），绝不能在窗口激活事件内同步调用，否则会死锁
+  restoreWebviewFocus: () => invoke('restore_webview_focus'),
 
   // 调整指定模型 WebView 的位置和大小
   resizeModelWebview: (

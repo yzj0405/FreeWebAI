@@ -30,6 +30,7 @@ pub fn run() {
             // 新增：多 WebView 缓存支持
             commands::get_or_create_model_webview,
             commands::switch_to_model,
+            commands::restore_webview_focus,
             commands::resize_model_webview,
             commands::hide_model_webview,
             commands::hide_all_model_webviews,
@@ -49,6 +50,13 @@ pub fn run() {
 
             // 初始化配置
             config::init_config(app.handle())?;
+
+            // 注意：不要在此处（或任何窗口事件回调中）调用 webview.set_focus()。
+            // WebView2 的焦点调用是同步跨进程 IPC，在 Focused 窗口事件（正在处理
+            // WM_ACTIVATE）中调用会与 WebView2 的激活流程互相等待，直接卡死主线程——
+            // 表现为窗口无法激活（alt+tab 切不过去）、所有主线程任务超时、页面无法加载。
+            // 切回窗口后需点击一次页面获得键盘焦点，属可接受的正常行为。
+
             Ok(())
         })
         .run(tauri::generate_context!())
