@@ -2,16 +2,21 @@
 import { ref, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { Setting, Minus, FullScreen, Close, DArrowLeft, DArrowRight, Loading, WarningFilled, Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
-import { tauriAPI, type Model, type AppConfig } from './utils/tauri-api'
+import { tauriAPI, type Model, type AppConfig, type UpdateInfo } from './utils/tauri-api'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { applyTheme, type ThemeMode } from './utils/theme'
 import Settings from './components/Settings.vue'
+import UpdateDialog from './components/UpdateDialog.vue'
 
 const config = ref<AppConfig | null>(null)
 const settingsVisible = ref(false)
 const isMaximized = ref(false)
 const loading = ref(true)
+
+// 顶栏异步版本检测（启动时静默检查，发现新版本显示更新徽标）
+const titleUpdateInfo = ref<UpdateInfo | null>(null)
+const updateDialogVisible = ref(false)
 
 // 当前选中的模型
 const activeModel = ref<Model | null>(null)
@@ -523,6 +528,15 @@ async function closeSettings() {
 
 onMounted(async () => {
   await loadConfig()
+
+  // 启动时异步检测新版本（静默，失败不打扰用户）
+  ;(async () => {
+    try {
+      titleUpdateInfo.value = await tauriAPI.checkForUpdate()
+    } catch {
+      // 检测失败静默处理，用户仍可在设置中手动检查
+    }
+  })()
   
   // 监听 WebView 页面真实加载完成事件（Rust on_page_load 回调，payload 携带 "webview-{id}" 标识）
   // 只处理当前正在加载/当前激活模型的事件，过滤被放弃的旧加载任务发出的过期事件，
@@ -605,6 +619,16 @@ onBeforeUnmount(() => {
     <header class="titlebar">
       <div class="titlebar-left">
         <span class="app-title">AI Hub Desktop</span>
+        <!-- 发现新版本时显示更新徽标，点击打开更新弹窗 -->
+        <button
+          v-if="titleUpdateInfo"
+          class="update-badge"
+          title="发现新版本，点击查看更新"
+          @click="updateDialogVisible = true"
+        >
+          <span class="update-badge-dot"></span>
+          可更新 v{{ titleUpdateInfo.latest }}
+        </button>
       </div>
       <div class="titlebar-right">
         <el-button @click="refreshCurrentModel" circle size="small" :disabled="!activeModel" title="刷新当前页面">
@@ -700,13 +724,19 @@ onBeforeUnmount(() => {
     </div>
 
     <!-- 设置弹窗 -->
-    <Settings 
+    <Settings
       v-model="settingsVisible"
       :config="config"
       :sidebar-collapsed="config?.sidebarCollapsed ?? false"
       @save="handleSaveConfig"
       @sync="handleSyncCloud"
       @close="closeSettings"
+    />
+
+    <!-- 应用更新弹窗（顶栏更新徽标入口，逻辑与设置中的更新一致） -->
+    <UpdateDialog
+      v-model="updateDialogVisible"
+      :initial-update-info="titleUpdateInfo"
     />
   </div>
 </template>
@@ -741,6 +771,34 @@ onBeforeUnmount(() => {
   font-size: 14px;
   font-weight: 600;
   color: var(--text-color);
+}
+
+/* 顶栏更新徽标（发现新版本时显示） */
+.update-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #e6a23c;
+  background: rgba(230, 162, 60, 0.12);
+  border: 1px solid rgba(230, 162, 60, 0.4);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.update-badge:hover {
+  background: rgba(230, 162, 60, 0.25);
+}
+
+.update-badge-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #e6a23c;
+  flex-shrink: 0;
 }
 
 .titlebar-right {

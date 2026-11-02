@@ -570,6 +570,25 @@ pub async fn get_or_create_model_webview(
         }
     });
 
+    // 新窗口请求（target="_blank" 链接 / window.open）：改用系统默认浏览器打开。
+    // 无处理器时 wry 会直接吞掉该请求（表现为点击链接无任何响应）。
+    // 注意：回调运行在 WebView2 COM 事件链上，这里只做轻量 spawn，
+    // 实际的浏览器拉起由后台任务执行，避免阻塞主线程。
+    let opener_app = app.clone();
+    webview_builder = webview_builder.on_new_window(move |url, _features| {
+        let url_str = url.to_string();
+        // Fn 闭包可能被多次调用，每次克隆句柄移入后台任务
+        let opener_app = opener_app.clone();
+        let _ = tauri::async_runtime::spawn(async move {
+            use tauri_plugin_opener::OpenerExt;
+            let _ = opener_app.opener().open_url(url_str, None::<&str>);
+        });
+        tauri::webview::NewWindowResponse::Deny
+    });
+
+    // 注入 Ctrl+点击链接拦截脚本（强制用系统浏览器打开，见常量注释）
+    webview_builder = webview_builder.initialization_script(LINK_INTERCEPT_SCRIPT);
+
     if !init_script.is_empty() {
         webview_builder = webview_builder.initialization_script(&init_script);
     }
@@ -929,6 +948,20 @@ const TAURI_PRODUCT_NAME: &str = "AI Hub Desktop";
 /// 目标架构
 const TAURI_ARCH: &str = "x64";
 
+/// 解析 "x.y.z" 格式的版本号为可比较的元组
+/// 忽略前导非数字与后缀（如 "v2.0.10-beta" → (2, 0, 10)），解析失败的段按 0 处理
+fn parse_version(version: &str) -> (u64, u64, u64) {
+    let v = version.trim().trim_start_matches('v').trim_start_matches('V');
+    let mut parts = v.split(|c| c == '.' || c == '-');
+    let mut next_num = || {
+        parts
+            .next()
+            .and_then(|p| p.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    (next_num(), next_num(), next_num())
+}
+
 /// 根据 Tauri bundler 命名规则构造安装包文件名
 /// NSIS: {ProductName}_{version}_{arch}-setup.exe
 /// MSI:  {ProductName}_{version}_{arch}_en-US.msi
@@ -1025,7 +1058,9 @@ pub async fn check_for_update(app: AppHandle) -> Result<Option<UpdateInfo>, Stri
         }
     };
 
-    if tag == current_version {
+    // 语义化版本比较：仅当远端版本**高于**本地时才提示更新
+    // （远端更旧或相同都不提示，避免本地新版本被旧 Release 提示"可更新"）
+    if parse_version(&tag) <= parse_version(&current_version) {
         return Ok(None);
     }
 
@@ -1192,6 +1227,27 @@ struct GitHubAsset {
     #[serde(default)]
     digest: Option<String>,
 }
+
+/// 链接拦截脚本：Ctrl+左键点击链接时，将其转为 window.open 新窗口请求，
+/// 经宿主 on_new_window 处理器转交系统默认浏览器打开。
+/// 背景：只有 target="_blank"/window.open 的链接会触发新窗口请求（浏览器打开），
+/// 普通链接是当前窗口导航、不会经过该通道——Ctrl+点击提供统一的"强制外部打开"入口。
+/// 使用捕获阶段监听，先于页面自身的点击处理（避免被 SPA 路由拦截）。
+const LINK_INTERCEPT_SCRIPT: &str = r#"
+(function() {
+  document.addEventListener('click', function(e) {
+    if (!e.ctrlKey || e.button !== 0) return;
+    var el = e.target;
+    while (el && el.nodeType === 1 && el.tagName !== 'A') { el = el.parentElement; }
+    if (!el || el.nodeType !== 1) return;
+    var href = el.href || '';
+    if (!/^https?:\/\//i.test(href)) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    window.open(href, '_blank');
+  }, true);
+})();
+"#;
 
 /// 生成主题初始化脚本
 fn generate_theme_init_script(theme: &str) -> String {
