@@ -581,6 +581,14 @@ pub async fn get_or_create_model_webview(
         let opener_app = opener_app.clone();
         let _ = tauri::async_runtime::spawn(async move {
             use tauri_plugin_opener::OpenerExt;
+            // 右键菜单"在新窗口打开"的 popup 关闭后，激活焦点处于归还过渡态，
+            // 此刻 ShellExecute 拉起的浏览器拿不到前台激活权，会在后台静默打开。
+            // 先把主窗口调回前台（Window::set_focus 是 Win32 SetForegroundWindow，
+            // 纯本地调用，与会死锁的 WebView2 COM 焦点接口无关），让浏览器继承前台，
+            // 与 Ctrl+点击路径行为一致。
+            if let Some(main_win) = opener_app.get_window("main") {
+                let _ = main_win.set_focus();
+            }
             let _ = opener_app.opener().open_url(url_str, None::<&str>);
         });
         tauri::webview::NewWindowResponse::Deny
