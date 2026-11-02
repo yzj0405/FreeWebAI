@@ -1,6 +1,4 @@
-/.npmrc
-/.qoder
-/dist
-/dist-electron
-/node_modules
-/Typora_Hook_Log.txt
+.qoder
+.vscode
+node_modules
+dist

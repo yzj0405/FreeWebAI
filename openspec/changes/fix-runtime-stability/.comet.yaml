@@ -1,0 +1,12 @@
+change: fix-runtime-stability
+phase: build
+schema: full
+created: "2026-07-02"
+language: zh-CN
+design_doc: docs/superpowers/specs/2026-07-02-fix-runtime-stability-design.md
+handoff_context: openspec/changes/fix-runtime-stability/.comet/handoff/brainstorm-summary.md
+plan: docs/superpowers/plans/2026-07-02-fix-runtime-stability.md
+isolation: branch
+build_mode: executing-plans
+tdd_mode: direct
+review_mode: off

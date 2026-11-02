@@ -109,7 +109,7 @@
     {
       "id": "copilot",
       "name": "Microsoft Copilot",
-      "url": "https://microsoft.com",
+      "url": "https://m365.cloud.microsoft/chat/",
       "version": "GPT-4o",
       "visible": true
     },
